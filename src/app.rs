@@ -79,6 +79,7 @@ pub enum View {
     Delete,
     NewEntry,
     Copy,
+    EditMeta,
 }
 
 // --- App ---
@@ -96,19 +97,30 @@ pub struct App<'a> {
     // Textarea editor
     pub editor: TextArea<'a>,
     // New entry state
+    pub new_name: String,
     pub new_path: String,
     pub new_stage: String,
-    pub new_field: usize,
+    pub new_field: usize, // 0=name, 1=path, 2=stage, 3=buttons
+    pub new_save: bool,   // true=Save selected, false=Cancel selected
     // Delete confirmation (true = Yes selected, false = No selected)
     pub delete_yes: bool,
+    // EditMeta state
+    pub meta_name: String,
+    pub meta_path: String,
+    pub meta_stage: String,
+    pub meta_field: usize, // 0=name, 1=path, 2=stage, 3=buttons
+    pub meta_save: bool,
     // Copy state
     pub copy_path: String,
     pub copy_stage: String,
-    pub copy_field: usize,
+    pub copy_field: usize, // 0=path, 1=stage, 2=buttons
+    pub copy_save: bool,
     // Import state
     pub import_candidates: Vec<ImportCandidate>,
     pub import_list_state: ListState,
     pub import_phase: ImportPhase,
+    // Store grouped view: maps visual list index → entry index (None = group header)
+    pub store_index_map: Vec<Option<usize>>,
     // Ticker
     pub tick: usize,
     // cwd for highlighting
@@ -133,16 +145,25 @@ impl<'a> App<'a> {
             message: None,
             store_list_state,
             editor: TextArea::default(),
+            new_name: String::new(),
             new_path: String::new(),
             new_stage: "default".to_string(),
             new_field: 0,
+            new_save: true,
             delete_yes: false,
+            meta_name: String::new(),
+            meta_path: String::new(),
+            meta_stage: String::new(),
+            meta_field: 0,
+            meta_save: true,
             copy_path: String::new(),
             copy_stage: "default".to_string(),
             copy_field: 0,
+            copy_save: true,
             import_candidates: Vec::new(),
             import_list_state: ListState::default(),
             import_phase: ImportPhase::Select,
+            store_index_map: Vec::new(),
             tick: 0,
             cwd: cwd.to_string(),
         }
@@ -153,11 +174,104 @@ impl<'a> App<'a> {
     }
 
     pub fn selected_entry(&self) -> Option<&EnvEntry> {
-        self.store_list_state.selected().and_then(|i| self.entries.get(i))
+        self.store_list_state
+            .selected()
+            .and_then(|vis| self.store_index_map.get(vis))
+            .and_then(|opt| opt.as_ref())
+            .and_then(|&idx| self.entries.get(idx))
     }
 
-    pub fn selected_index(&self) -> usize {
-        self.store_list_state.selected().unwrap_or(0)
+    pub fn selected_entry_index(&self) -> Option<usize> {
+        self.store_list_state
+            .selected()
+            .and_then(|vis| self.store_index_map.get(vis))
+            .and_then(|opt| *opt)
+    }
+
+    /// Build grouped index map: cwd entries first, then others, with path headers
+    pub fn rebuild_store_map(&mut self) {
+        let mut map: Vec<Option<usize>> = Vec::new();
+        let mut by_path: std::collections::BTreeMap<&str, Vec<usize>> = std::collections::BTreeMap::new();
+
+        for (i, entry) in self.entries.iter().enumerate() {
+            by_path.entry(&entry.path).or_default().push(i);
+        }
+
+        // cwd group first
+        if let Some(indices) = by_path.remove(self.cwd.as_str()) {
+            map.push(None); // header
+            for idx in indices {
+                map.push(Some(idx));
+            }
+        }
+
+        // then all other groups
+        for (_path, indices) in &by_path {
+            map.push(None); // header
+            for &idx in indices {
+                map.push(Some(idx));
+            }
+        }
+
+        self.store_index_map = map;
+
+        // Select first selectable item if current selection is invalid
+        if let Some(vis) = self.store_list_state.selected() {
+            if vis >= self.store_index_map.len()
+                || self.store_index_map.get(vis).is_none_or(|o| o.is_none())
+            {
+                self.store_select_first();
+            }
+        } else {
+            self.store_select_first();
+        }
+    }
+
+    fn store_select_first(&mut self) {
+        let first = self.store_index_map.iter().position(|o| o.is_some());
+        self.store_list_state.select(first);
+    }
+
+    /// Select an entry by path+stage in the grouped view
+    pub fn store_select_entry(&mut self, path: &str, stage: &str) {
+        let entry_idx = self.entries.iter().position(|e| e.path == path && e.stage == stage);
+        if let Some(eidx) = entry_idx {
+            let vis = self.store_index_map.iter().position(|o| *o == Some(eidx));
+            if let Some(v) = vis {
+                self.store_list_state.select(Some(v));
+            }
+        }
+    }
+
+    /// Reload entries from keyring and rebuild map
+    pub async fn reload_entries(&mut self) -> Result<()> {
+        self.entries = self.keyring.load_all_entries().await?;
+        self.rebuild_store_map();
+        Ok(())
+    }
+
+    /// Move store selection up, skipping headers
+    pub fn store_move_up(&mut self) {
+        if let Some(vis) = self.store_list_state.selected() {
+            for i in (0..vis).rev() {
+                if self.store_index_map.get(i).is_some_and(|o| o.is_some()) {
+                    self.store_list_state.select(Some(i));
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Move store selection down, skipping headers
+    pub fn store_move_down(&mut self) {
+        if let Some(vis) = self.store_list_state.selected() {
+            for i in (vis + 1)..self.store_index_map.len() {
+                if self.store_index_map.get(i).is_some_and(|o| o.is_some()) {
+                    self.store_list_state.select(Some(i));
+                    return;
+                }
+            }
+        }
     }
 
     pub fn enter_editor(&mut self) {
@@ -174,9 +288,11 @@ impl<'a> App<'a> {
     }
 
     pub fn enter_new_entry(&mut self) {
+        self.new_name = String::new();
         self.new_path = self.cwd.clone();
         self.new_stage = "default".to_string();
         self.new_field = 0;
+        self.new_save = true;
         self.view = View::NewEntry;
     }
 
@@ -185,11 +301,24 @@ impl<'a> App<'a> {
         self.view = View::Delete;
     }
 
+    pub fn enter_edit_meta(&mut self) {
+        let data = self.selected_entry().map(|e| (e.name.clone(), e.path.clone(), e.stage.clone()));
+        if let Some((name, path, stage)) = data {
+            self.meta_name = name;
+            self.meta_path = path;
+            self.meta_stage = stage;
+            self.meta_field = 0;
+            self.meta_save = true;
+            self.view = View::EditMeta;
+        }
+    }
+
     pub fn enter_copy(&mut self) {
         if self.selected_entry().is_some() {
             self.copy_path = self.cwd.clone();
             self.copy_stage = "default".to_string();
             self.copy_field = 0;
+            self.copy_save = true;
             self.view = View::Copy;
         }
     }
@@ -338,6 +467,7 @@ pub async fn run_tui() -> Result<()> {
         .unwrap_or_default();
 
     let mut app = App::new(kr, entries, &cwd);
+    app.rebuild_store_map();
     app.scan_env_files();
 
     // Start on Import tab if there are actionable candidates
@@ -380,6 +510,7 @@ async fn run_event_loop(terminal: &mut DefaultTerminal, app: &mut App<'_>) -> Re
                     View::Delete => handle_delete_input(app, key).await?,
                     View::NewEntry => handle_new_entry_input(app, key).await?,
                     View::Copy => handle_copy_input(app, key).await?,
+                    View::EditMeta => handle_edit_meta_input(app, key).await?,
                 }
             }
         }
@@ -462,13 +593,9 @@ async fn handle_import_select(app: &mut App<'_>, key: event::KeyEvent) -> Result
             if count == 0 {
                 app.msg(MsgKind::Warning, "Nothing selected");
             } else {
-                app.entries = app.keyring.load_all_entries().await?;
-
-                // Select first imported entry in store list
-                let pos = app.entries.iter().position(|e| e.path == app.cwd && e.stage == first_stage);
-                if let Some(i) = pos {
-                    app.store_list_state.select(Some(i));
-                }
+                app.reload_entries().await?;
+                let cwd = app.cwd.clone();
+                app.store_select_entry(&cwd, &first_stage);
 
                 let id_list = ids.join(", ");
                 app.msg(MsgKind::Success, format!("{count} imported [{}]", id_list));
@@ -486,20 +613,12 @@ async fn handle_store_input(app: &mut App<'_>, key: event::KeyEvent) -> Result<(
     match key.code {
         KeyCode::Esc => app.should_quit = true,
         KeyCode::Up | KeyCode::Char('k') => {
-            if let Some(i) = app.store_list_state.selected() {
-                if i > 0 {
-                    app.store_list_state.select(Some(i - 1));
-                    app.message = None;
-                }
-            }
+            app.store_move_up();
+            app.message = None;
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if let Some(i) = app.store_list_state.selected() {
-                if i + 1 < app.entries.len() {
-                    app.store_list_state.select(Some(i + 1));
-                    app.message = None;
-                }
-            }
+            app.store_move_down();
+            app.message = None;
         }
         KeyCode::Char('e') | KeyCode::Enter => app.enter_editor(),
         KeyCode::Char('d') => {
@@ -509,6 +628,11 @@ async fn handle_store_input(app: &mut App<'_>, key: event::KeyEvent) -> Result<(
         }
         KeyCode::Char('s') => app.show_values = !app.show_values,
         KeyCode::Char('n') => app.enter_new_entry(),
+        KeyCode::Char('r') => {
+            if app.selected_entry().is_some() {
+                app.enter_edit_meta();
+            }
+        }
         KeyCode::Char('c') => {
             if !app.entries.is_empty() {
                 app.enter_copy();
@@ -553,14 +677,16 @@ async fn handle_editor_input(app: &mut App<'_>, key: event::KeyEvent) -> Result<
         }
 
         // Save directly
-        let idx = app.selected_index();
-        if let Some(entry) = app.entries.get(idx) {
+        if let Some(entry) = app.selected_entry() {
             let path = entry.path.clone();
             let stage = entry.stage.clone();
             let vars = app.editor_vars();
-            app.keyring.save_envs(&path, &stage, &vars).await?;
-            if let Some(e) = app.entries.get_mut(idx) {
-                e.vars = vars;
+            app.keyring.save_envs(&path, &stage, "", &vars).await?;
+            // Update in-place
+            if let Some(idx) = app.selected_entry_index() {
+                if let Some(e) = app.entries.get_mut(idx) {
+                    e.vars = vars;
+                }
             }
             app.msg(MsgKind::Success, "Saved");
         }
@@ -582,17 +708,11 @@ async fn handle_delete_input(app: &mut App<'_>, key: event::KeyEvent) -> Result<
         KeyCode::Char('n') => app.delete_yes = false,
         KeyCode::Enter => {
             if app.delete_yes {
-                let idx = app.selected_index();
-                if let Some(entry) = app.entries.get(idx) {
+                if let Some(entry) = app.selected_entry() {
                     let path = entry.path.clone();
                     let stage = entry.stage.clone();
                     app.keyring.delete_entry(&path, &stage).await?;
-                    app.entries = app.keyring.load_all_entries().await?;
-                    if idx >= app.entries.len() && idx > 0 {
-                        app.store_list_state.select(Some(idx - 1));
-                    } else if app.entries.is_empty() {
-                        app.store_list_state.select(None);
-                    }
+                    app.reload_entries().await?;
                     app.msg(MsgKind::Success, "Deleted");
                 }
             }
@@ -608,26 +728,49 @@ async fn handle_delete_input(app: &mut App<'_>, key: event::KeyEvent) -> Result<
 async fn handle_new_entry_input(app: &mut App<'_>, key: event::KeyEvent) -> Result<()> {
     match key.code {
         KeyCode::Esc => app.view = View::Tabs,
-        KeyCode::Tab => app.new_field = if app.new_field == 0 { 1 } else { 0 },
+        KeyCode::Up => {
+            if app.new_field > 0 { app.new_field -= 1; }
+        }
+        KeyCode::Down | KeyCode::Tab => {
+            if app.new_field < 3 { app.new_field += 1; }
+        }
+        KeyCode::Left | KeyCode::Right if app.new_field == 3 => {
+            app.new_save = !app.new_save;
+        }
         KeyCode::Enter => {
-            if !app.new_path.is_empty() && !app.new_stage.is_empty() {
-                app.keyring.save_envs(&app.new_path, &app.new_stage, &[]).await?;
-                app.entries = app.keyring.load_all_entries().await?;
-                let pos = app.entries.iter().position(|e| e.path == app.new_path && e.stage == app.new_stage);
-                if let Some(i) = pos {
-                    app.store_list_state.select(Some(i));
+            if app.new_field == 3 {
+                if !app.new_save {
+                    app.view = View::Tabs;
+                    return Ok(());
                 }
+                // Save
+                let path = if app.new_path.is_empty() { "global".to_string() } else { app.new_path.clone() };
+                if app.new_stage.is_empty() {
+                    app.msg(MsgKind::Error, "Stage is required");
+                    return Ok(());
+                }
+                app.keyring.save_envs(&path, &app.new_stage, &app.new_name, &[]).await?;
+                let stage = app.new_stage.clone();
+                app.reload_entries().await?;
+                app.store_select_entry(&path, &stage);
                 app.msg(MsgKind::Success, "Created");
                 app.view = View::Tabs;
                 app.enter_editor();
+            } else {
+                // Enter on a field = move to next field
+                if app.new_field < 3 { app.new_field += 1; }
             }
         }
-        KeyCode::Char(c) => {
-            if app.new_field == 0 { app.new_path.push(c); } else { app.new_stage.push(c); }
-        }
-        KeyCode::Backspace => {
-            if app.new_field == 0 { app.new_path.pop(); } else { app.new_stage.pop(); }
-        }
+        KeyCode::Char(c) if app.new_field < 3 => match app.new_field {
+            0 => app.new_name.push(c),
+            1 => app.new_path.push(c),
+            _ => app.new_stage.push(c),
+        },
+        KeyCode::Backspace if app.new_field < 3 => match app.new_field {
+            0 => { app.new_name.pop(); }
+            1 => { app.new_path.pop(); }
+            _ => { app.new_stage.pop(); }
+        },
         _ => {}
     }
     Ok(())
@@ -638,28 +781,104 @@ async fn handle_new_entry_input(app: &mut App<'_>, key: event::KeyEvent) -> Resu
 async fn handle_copy_input(app: &mut App<'_>, key: event::KeyEvent) -> Result<()> {
     match key.code {
         KeyCode::Esc => app.view = View::Tabs,
-        KeyCode::Tab => app.copy_field = if app.copy_field == 0 { 1 } else { 0 },
+        KeyCode::Up => {
+            if app.copy_field > 0 { app.copy_field -= 1; }
+        }
+        KeyCode::Down | KeyCode::Tab => {
+            if app.copy_field < 2 { app.copy_field += 1; }
+        }
+        KeyCode::Left | KeyCode::Right if app.copy_field == 2 => {
+            app.copy_save = !app.copy_save;
+        }
         KeyCode::Enter => {
-            if !app.copy_path.is_empty() && !app.copy_stage.is_empty() {
-                if let Some(entry) = app.entries.get(app.selected_index()) {
+            if app.copy_field == 2 {
+                if !app.copy_save {
+                    app.view = View::Tabs;
+                    return Ok(());
+                }
+                let path = if app.copy_path.is_empty() { "global".to_string() } else { app.copy_path.clone() };
+                if app.copy_stage.is_empty() {
+                    app.msg(MsgKind::Error, "Stage is required");
+                    return Ok(());
+                }
+                if let Some(entry) = app.selected_entry() {
                     let vars = entry.vars.clone();
-                    app.keyring.save_envs(&app.copy_path, &app.copy_stage, &vars).await?;
-                    app.entries = app.keyring.load_all_entries().await?;
-                    let pos = app.entries.iter().position(|e| e.path == app.copy_path && e.stage == app.copy_stage);
-                    if let Some(i) = pos {
-                        app.store_list_state.select(Some(i));
-                    }
+                    app.keyring.save_envs(&path, &app.copy_stage, "", &vars).await?;
+                    let stage = app.copy_stage.clone();
+                    app.reload_entries().await?;
+                    app.store_select_entry(&path, &stage);
                     app.msg(MsgKind::Success, "Copied");
                 }
                 app.view = View::Tabs;
+            } else {
+                if app.copy_field < 2 { app.copy_field += 1; }
             }
         }
-        KeyCode::Char(c) => {
+        KeyCode::Char(c) if app.copy_field < 2 => {
             if app.copy_field == 0 { app.copy_path.push(c); } else { app.copy_stage.push(c); }
         }
-        KeyCode::Backspace => {
+        KeyCode::Backspace if app.copy_field < 2 => {
             if app.copy_field == 0 { app.copy_path.pop(); } else { app.copy_stage.pop(); }
         }
+        _ => {}
+    }
+    Ok(())
+}
+
+// --- EditMeta (rename/move) ---
+
+async fn handle_edit_meta_input(app: &mut App<'_>, key: event::KeyEvent) -> Result<()> {
+    match key.code {
+        KeyCode::Esc => app.view = View::Tabs,
+        KeyCode::Up => {
+            if app.meta_field > 0 { app.meta_field -= 1; }
+        }
+        KeyCode::Down | KeyCode::Tab => {
+            if app.meta_field < 3 { app.meta_field += 1; }
+        }
+        KeyCode::Left | KeyCode::Right if app.meta_field == 3 => {
+            app.meta_save = !app.meta_save;
+        }
+        KeyCode::Enter => {
+            if app.meta_field == 3 {
+                if !app.meta_save {
+                    app.view = View::Tabs;
+                    return Ok(());
+                }
+                let new_path = if app.meta_path.is_empty() { "global".to_string() } else { app.meta_path.clone() };
+                if app.meta_stage.is_empty() {
+                    app.msg(MsgKind::Error, "Stage is required");
+                    return Ok(());
+                }
+                if let Some(entry) = app.selected_entry() {
+                    let old_path = entry.path.clone();
+                    let old_stage = entry.stage.clone();
+                    let vars = entry.vars.clone();
+
+                    // Delete old entry, create new with updated meta
+                    app.keyring.delete_entry(&old_path, &old_stage).await?;
+                    app.keyring.save_envs(&new_path, &app.meta_stage, &app.meta_name, &vars).await?;
+
+                    let stage = app.meta_stage.clone();
+                    app.reload_entries().await?;
+                    app.store_select_entry(&new_path, &stage);
+                    app.msg(MsgKind::Success, "Updated");
+                }
+                app.view = View::Tabs;
+            } else {
+                if app.meta_field < 3 { app.meta_field += 1; }
+            }
+        }
+        KeyCode::Char(c) if app.meta_field < 3 => match app.meta_field {
+            0 => app.meta_name.push(c),
+            1 => app.meta_path.push(c),
+            _ => app.meta_stage.push(c),
+        },
+        KeyCode::Backspace if app.meta_field < 3 => match app.meta_field {
+            0 => { app.meta_name.pop(); }
+            1 => { app.meta_path.pop(); }
+            _ => { app.meta_stage.pop(); }
+        },
         _ => {}
     }
     Ok(())

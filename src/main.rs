@@ -137,9 +137,15 @@ async fn agent_info() -> anyhow::Result<()> {
         println!("{}{}", path, marker);
         for entry in path_entries {
             let keys: Vec<&str> = entry.vars.iter().map(|(k, _)| k.as_str()).collect();
+            let name_info = if entry.name.is_empty() {
+                String::new()
+            } else {
+                format!(" \"{}\"", entry.name)
+            };
             println!(
-                "  {} [{}]  {} keys: {}",
+                "  {}{} [{}]  {} keys: {}",
                 entry.id,
+                name_info,
                 entry.stage,
                 entry.vars.len(),
                 keys.join(", ")
@@ -164,7 +170,11 @@ async fn run_with_picker(cmd: &[String]) -> anyhow::Result<()> {
         std::process::exit(1);
     }
 
-    let selected = inline_pick(&entries)?;
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let selected = inline_pick(&entries, &cwd)?;
 
     match selected {
         Some(idx) => {
@@ -181,91 +191,108 @@ async fn run_with_picker(cmd: &[String]) -> anyhow::Result<()> {
     }
 }
 
-/// Minimal inline terminal picker
-fn inline_pick(entries: &[keyring::EnvEntry]) -> anyhow::Result<Option<usize>> {
+/// Minimal inline terminal picker with Tab for Local/All
+fn inline_pick(entries: &[keyring::EnvEntry], cwd: &str) -> anyhow::Result<Option<usize>> {
+    let local_indices: Vec<usize> = entries.iter().enumerate()
+        .filter(|(_, e)| e.path == cwd)
+        .map(|(i, _)| i)
+        .collect();
+    let all_indices: Vec<usize> = (0..entries.len()).collect();
+
+    let has_local = !local_indices.is_empty();
+    let mut show_local = has_local;
     let mut stdout = std::io::stdout();
-    let mut selected: usize = 0;
-    let max_visible = 8.min(entries.len());
-    let total_lines = max_visible + 1; // entries + help line
+    let mut cursor: usize = 0;
+    let max_visible = 8;
+    // Reserve max space (entries + header + help)
+    let reserve = max_visible + 2;
 
     terminal::enable_raw_mode()?;
     crossterm::execute!(stdout, crossterm::cursor::Hide)?;
 
-    // Reserve space so terminal scrolls now, not during redraws
-    for _ in 0..total_lines {
+    for _ in 0..reserve {
         write!(stdout, "\r\n")?;
     }
-    write!(stdout, "\x1b[{}A", total_lines)?;
+    write!(stdout, "\x1b[{}A", reserve)?;
     stdout.flush()?;
 
     let result = (|| -> anyhow::Result<Option<usize>> {
         loop {
-            let offset = if selected >= max_visible {
-                selected - max_visible + 1
+            let indices = if show_local { &local_indices } else { &all_indices };
+            let count = indices.len();
+            if cursor >= count && count > 0 {
+                cursor = count - 1;
+            }
+            let visible = max_visible.min(count);
+
+            let offset = if cursor >= visible {
+                cursor - visible + 1
             } else {
                 0
             };
 
-            for i in 0..max_visible {
-                let idx = offset + i;
-                if idx < entries.len() {
-                    let entry = &entries[idx];
-                    let short = std::path::Path::new(&entry.path)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or(&entry.path);
+            // Header: Local/All tabs
+            let local_label = if show_local { "\x1b[1;35mLocal\x1b[0m" } else { "\x1b[90mLocal\x1b[0m" };
+            let all_label = if !show_local { "\x1b[1;35mAll\x1b[0m" } else { "\x1b[90mAll\x1b[0m" };
+            write!(stdout, "\r {local_label} │ {all_label}\x1b[K\r\n")?;
 
-                    if idx == selected {
-                        write!(
-                            stdout,
-                            "\r\x1b[1;35m▸ {} {} [{}]\x1b[0m\x1b[K\r\n",
-                            entry.id, short, entry.stage
-                        )?;
+            // Entries
+            for i in 0..max_visible {
+                let list_idx = offset + i;
+                if list_idx < count {
+                    let entry_idx = indices[list_idx];
+                    let entry = &entries[entry_idx];
+                    let name = entry.display_name();
+
+                    if list_idx == cursor {
+                        write!(stdout, "\r\x1b[1;35m▸ {} {} [{}]\x1b[0m\x1b[K\r\n", entry.id, name, entry.stage)?;
                     } else {
-                        write!(
-                            stdout,
-                            "\r  {} {} [{}]\x1b[K\r\n",
-                            entry.id, short, entry.stage
-                        )?;
+                        write!(stdout, "\r  {} {} [{}]\x1b[K\r\n", entry.id, name, entry.stage)?;
                     }
                 } else {
                     write!(stdout, "\r\x1b[K\r\n")?;
                 }
             }
-            write!(
-                stdout,
-                "\r\x1b[90m↑↓ select │ Enter run │ Esc cancel\x1b[0m\x1b[K"
-            )?;
+
+            // Help
+            let tab_hint = if has_local { "Tab local/all │ " } else { "" };
+            write!(stdout, "\r\x1b[90m↑↓ select │ {tab_hint}Enter run │ Esc cancel\x1b[0m\x1b[K")?;
             stdout.flush()?;
 
             if let Event::Key(key) = event::read()? {
                 match key.code {
                     KeyCode::Up | KeyCode::Char('k') => {
-                        if selected > 0 {
-                            selected -= 1;
-                        }
+                        if cursor > 0 { cursor -= 1; }
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        if selected + 1 < entries.len() {
-                            selected += 1;
+                        let indices = if show_local { &local_indices } else { &all_indices };
+                        if cursor + 1 < indices.len() { cursor += 1; }
+                    }
+                    KeyCode::Tab => {
+                        if has_local {
+                            show_local = !show_local;
+                            cursor = 0;
                         }
                     }
                     KeyCode::Enter => {
-                        // Clear: go to top of our area, clear each line
-                        write!(stdout, "\r\x1b[{}A", max_visible)?;
-                        for _ in 0..total_lines {
-                            write!(stdout, "\r\x1b[K\r\n")?;
+                        let indices = if show_local { &local_indices } else { &all_indices };
+                        if let Some(&entry_idx) = indices.get(cursor) {
+                            // Clear
+                            write!(stdout, "\r\x1b[{}A", max_visible + 1)?;
+                            for _ in 0..reserve {
+                                write!(stdout, "\r\x1b[K\r\n")?;
+                            }
+                            write!(stdout, "\x1b[{}A", reserve)?;
+                            stdout.flush()?;
+                            return Ok(Some(entry_idx));
                         }
-                        write!(stdout, "\x1b[{}A", total_lines)?;
-                        stdout.flush()?;
-                        return Ok(Some(selected));
                     }
                     KeyCode::Esc | KeyCode::Char('q') => {
-                        write!(stdout, "\r\x1b[{}A", max_visible)?;
-                        for _ in 0..total_lines {
+                        write!(stdout, "\r\x1b[{}A", max_visible + 1)?;
+                        for _ in 0..reserve {
                             write!(stdout, "\r\x1b[K\r\n")?;
                         }
-                        write!(stdout, "\x1b[{}A", total_lines)?;
+                        write!(stdout, "\x1b[{}A", reserve)?;
                         stdout.flush()?;
                         return Ok(None);
                     }
@@ -273,8 +300,8 @@ fn inline_pick(entries: &[keyring::EnvEntry]) -> anyhow::Result<Option<usize>> {
                 }
             }
 
-            // Move back to top of our reserved area for redraw
-            write!(stdout, "\r\x1b[{}A", max_visible)?;
+            // Move back to top for redraw
+            write!(stdout, "\r\x1b[{}A", max_visible + 1)?;
         }
     })();
 

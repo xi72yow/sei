@@ -228,6 +228,7 @@ impl Keyring {
                 let vars = parse_env_content(&secret);
                 entries.push(EnvEntry {
                     id: attrs.get("id").cloned().unwrap_or_else(|| "–".to_string()),
+                    name: attrs.get("name").cloned().unwrap_or_default(),
                     path: attrs.get("path").cloned().unwrap_or_default(),
                     stage: attrs.get("stage").cloned().unwrap_or_else(|| "default".to_string()),
                     vars,
@@ -241,7 +242,7 @@ impl Keyring {
         Ok(entries)
     }
 
-    pub async fn save_envs(&self, path: &str, stage: &str, vars: &[(String, String)]) -> Result<String> {
+    pub async fn save_envs(&self, path: &str, stage: &str, name: &str, vars: &[(String, String)]) -> Result<String> {
         self.unlock().await?;
         let now = unix_now().to_string();
 
@@ -249,25 +250,27 @@ impl Keyring {
         let search_attrs = HashMap::from([("path", path), ("stage", stage), ("type", "sei-dotenv")]);
         let existing = self.search_items(search_attrs).await?;
 
-        let (id, created_at) = if let Some(item) = existing.first() {
+        let (id, created_at, existing_name) = if let Some(item) = existing.first() {
             let attrs = self.get_item_attrs(item).await?;
-            let id = attrs.get("id").cloned().unwrap_or_else(|| {
-                // Legacy entry without ID — will be assigned below
-                String::new()
-            });
+            let id = attrs.get("id").cloned().unwrap_or_default();
             let created = attrs.get("created_at").cloned().unwrap_or_else(|| now.clone());
-            (id, created)
+            let ename = attrs.get("name").cloned().unwrap_or_default();
+            // Delete old entry to prevent duplicates (replace only matches if ALL attrs are identical)
+            self.delete_item(item).await?;
+            (id, created, ename)
         } else {
-            (String::new(), now.clone())
+            (String::new(), now.clone(), String::new())
         };
 
-        // Assign ID if missing
         let id = if id.is_empty() {
             let used = self.get_all_ids().await?;
             Self::next_id(&used)
         } else {
             id
         };
+
+        // Use provided name, or keep existing name
+        let final_name = if !name.is_empty() { name } else { &existing_name };
 
         let content = serialize_env_vars(vars);
         let label = format!("dotenv: {path} [{stage}]");
@@ -276,11 +279,12 @@ impl Keyring {
             ("stage", stage),
             ("type", "sei-dotenv"),
             ("id", id.as_str()),
+            ("name", final_name),
             ("created_at", created_at.as_str()),
             ("updated_at", now.as_str()),
         ]);
 
-        self.create_item(&label, attrs, content.as_bytes(), true).await?;
+        self.create_item(&label, attrs, content.as_bytes(), false).await?;
         Ok(id)
     }
 
@@ -303,7 +307,7 @@ impl Keyring {
         if vars.is_empty() {
             bail!("No valid KEY=VALUE pairs found in {}", env_file.display());
         }
-        self.save_envs(path, stage, &vars).await
+        self.save_envs(path, stage, "", &vars).await
     }
 }
 
@@ -351,11 +355,26 @@ async fn find_or_create_collection(conn: &Connection, _session: &OwnedObjectPath
 #[derive(Debug, Clone)]
 pub struct EnvEntry {
     pub id: String,
+    pub name: String,
     pub path: String,
     pub stage: String,
     pub vars: Vec<(String, String)>,
     pub created_at: u64,
     pub updated_at: u64,
+}
+
+impl EnvEntry {
+    /// Display name: custom name if set, otherwise last folder component
+    pub fn display_name(&self) -> &str {
+        if !self.name.is_empty() {
+            &self.name
+        } else {
+            std::path::Path::new(&self.path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&self.path)
+        }
+    }
 }
 
 pub fn parse_env_content(content: &[u8]) -> Vec<(String, String)> {
@@ -479,7 +498,7 @@ mod tests {
             ("ANOTHER".into(), "123".into()),
         ];
 
-        let id = kr.save_envs(path, stage, &vars).await.expect("save failed");
+        let id = kr.save_envs(path, stage, "test-entry", &vars).await.expect("save failed");
         assert_eq!(id.len(), 3);
 
         let all = kr.load_all_entries().await.expect("load_all failed");
@@ -502,7 +521,7 @@ mod tests {
         let stage = "test";
         let vars = vec![("KEY".into(), "val".into())];
 
-        kr.save_envs(path, stage, &vars).await.expect("save failed");
+        kr.save_envs(path, stage, "", &vars).await.expect("save failed");
         drop(kr);
 
         let loaded = load_envs(path, stage).await.expect("load failed");

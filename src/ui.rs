@@ -30,6 +30,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             draw_tabs(frame, app);
             draw_copy_popup(frame, app);
         }
+        View::EditMeta => {
+            draw_tabs(frame, app);
+            draw_edit_meta_popup(frame, app);
+        }
     }
 }
 
@@ -119,10 +123,10 @@ fn draw_keys_bar(frame: &mut Frame, app: &App, area: Rect) {
     let keys = match &app.view {
         View::Editor => "Paste: Ctrl+Shift+V │ Esc: save │ Ctrl+Q: discard",
         View::Delete => "←→ select │ Y/N │ Enter confirm │ Esc cancel",
-        View::NewEntry | View::Copy => "Tab: switch field │ Enter: confirm │ Esc: cancel",
+        View::NewEntry | View::Copy | View::EditMeta => "↑↓ navigate │ ←→ buttons │ Enter confirm │ Esc cancel",
         View::Tabs => match app.active_tab {
             Tab::Import => "↑↓ nav │ Space toggle │ Enter import │ Tab Store │ Esc quit",
-            Tab::Store => "[E]dit │ [D]elete │ [C]opy │ [S]how │ [N]ew │ [I]mport │ Tab Import │ Esc quit",
+            Tab::Store => "[E]dit │ [R]ename │ [D]elete │ [C]opy │ [S]how │ [N]ew │ Tab │ Esc",
         },
     };
     let bar = Paragraph::new(keys).style(Style::default().fg(DIM));
@@ -342,13 +346,6 @@ fn draw_store_tab(frame: &mut Frame, app: &mut App, area: Rect) {
     draw_details(frame, app, chunks[1]);
 }
 
-fn short_path(path: &str) -> &str {
-    std::path::Path::new(path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(path)
-}
-
 fn ticker(text: &str, width: usize, tick: usize) -> String {
     let text_len = text.chars().count();
     if text_len <= width || width == 0 {
@@ -378,16 +375,33 @@ fn draw_project_list(frame: &mut Frame, app: &mut App, area: Rect) {
     let cwd = &app.cwd;
 
     let items: Vec<ListItem> = app
-        .entries
+        .store_index_map
         .iter()
-        .map(|entry| {
-            let is_cwd = entry.path == *cwd;
-            let mut style = Style::default();
-            if is_cwd {
-                style = style.fg(Color::Cyan);
+        .enumerate()
+        .map(|(vis_idx, opt)| {
+            match opt {
+                None => {
+                    // Group header — find the path from the next entry
+                    let path = app.store_index_map[vis_idx + 1..]
+                        .iter()
+                        .find_map(|o| o.and_then(|i| app.entries.get(i)))
+                        .map(|e| e.path.as_str())
+                        .unwrap_or("?");
+                    let is_cwd = path == cwd;
+                    let label = if is_cwd {
+                        format!("── {} ", path)
+                    } else {
+                        format!("── {} ", path)
+                    };
+                    let color = if is_cwd { Color::Cyan } else { DIM };
+                    ListItem::new(Span::styled(label, Style::default().fg(color).add_modifier(Modifier::BOLD)))
+                }
+                Some(entry_idx) => {
+                    let entry = &app.entries[*entry_idx];
+                    let text = format!("  {} {} [{}]", entry.id, entry.display_name(), entry.stage);
+                    ListItem::new(text)
+                }
             }
-            let text = format!("{} {} [{}]", entry.id, short_path(&entry.path), entry.stage);
-            ListItem::new(text).style(style)
         })
         .collect();
 
@@ -404,7 +418,7 @@ fn draw_project_list(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_stateful_widget(list, area, &mut app.store_list_state);
 
     // Scrollbar
-    let count = app.entries.len();
+    let count = app.store_index_map.len();
     if count > area.height.saturating_sub(2) as usize {
         let mut scrollbar_state = ScrollbarState::new(count)
             .position(app.store_list_state.selected().unwrap_or(0));
@@ -431,29 +445,40 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    let has_name = !entry.name.is_empty();
+    let header_height = if has_name { 7 } else { 6 };
+
     let detail_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(6), Constraint::Min(1)])
+        .constraints([Constraint::Length(header_height), Constraint::Min(1)])
         .split(inner);
 
-    let path_width = detail_chunks[0].width.saturating_sub(7) as usize;
+    let path_width = detail_chunks[0].width.saturating_sub(9) as usize;
     let path_display = ticker(&entry.path, path_width, app.tick);
 
-    let header = Paragraph::new(vec![
+    let mut header_lines = vec![
         Line::from(vec![
-            Span::styled("ID:    ", Style::default().fg(DIM)),
+            Span::styled("ID:      ", Style::default().fg(DIM)),
             Span::styled(&entry.id, Style::default().add_modifier(Modifier::BOLD)),
         ]),
+    ];
+    if has_name {
+        header_lines.push(Line::from(vec![
+            Span::styled("Name:    ", Style::default().fg(DIM)),
+            Span::styled(&entry.name, Style::default().fg(ACCENT)),
+        ]));
+    }
+    header_lines.extend([
         Line::from(vec![
-            Span::styled("Path:  ", Style::default().fg(DIM)),
+            Span::styled("Path:    ", Style::default().fg(DIM)),
             Span::raw(path_display),
         ]),
         Line::from(vec![
-            Span::styled("Stage: ", Style::default().fg(DIM)),
+            Span::styled("Stage:   ", Style::default().fg(DIM)),
             Span::raw(&entry.stage),
         ]),
         Line::from(vec![
-            Span::styled("Keys:  ", Style::default().fg(DIM)),
+            Span::styled("Keys:    ", Style::default().fg(DIM)),
             Span::raw(entry.vars.len().to_string()),
         ]),
         Line::from(vec![
@@ -465,6 +490,7 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw(keyring::relative_time(entry.updated_at)),
         ]),
     ]);
+    let header = Paragraph::new(header_lines);
     frame.render_widget(header, detail_chunks[0]);
 
     let rows: Vec<Row> = entry
@@ -589,21 +615,66 @@ fn draw_delete_popup(frame: &mut Frame, app: &App) {
 }
 
 fn draw_new_entry_popup(frame: &mut Frame, app: &App) {
-    let area = centered_rect(50, 30, frame.area());
+    let area = centered_rect_abs(50, 12, frame.area());
     frame.render_widget(Clear, area);
 
-    let path_style = if app.new_field == 0 { Style::default().fg(ACCENT) } else { Style::default() };
-    let stage_style = if app.new_field == 1 { Style::default().fg(ACCENT) } else { Style::default() };
+    let field_style = |f: usize| {
+        if app.new_field == f {
+            Style::default().fg(ACCENT).bg(Color::DarkGray)
+        } else {
+            Style::default()
+        }
+    };
+    let label_style = |f: usize| {
+        if app.new_field == f {
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(DIM)
+        }
+    };
+
+    let save_style = if app.new_field == 3 && app.new_save {
+        Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(DIM)
+    };
+    let cancel_style = if app.new_field == 3 && !app.new_save {
+        Style::default().fg(Color::Black).bg(Color::Red).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(DIM)
+    };
+
+    let name_val = if app.new_name.is_empty() && app.new_field != 0 {
+        Span::styled("(optional)", Style::default().fg(DIM))
+    } else {
+        Span::styled(&app.new_name, field_style(0))
+    };
+    let path_val = if app.new_path.is_empty() && app.new_field != 1 {
+        Span::styled("(global)", Style::default().fg(DIM))
+    } else {
+        Span::styled(&app.new_path, field_style(1))
+    };
 
     let lines = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled("Path:  ", Style::default().fg(DIM)),
-            Span::styled(&app.new_path, path_style),
+            Span::styled("  Name:  ", label_style(0)),
+            name_val,
         ]),
         Line::from(vec![
-            Span::styled("Stage: ", Style::default().fg(DIM)),
-            Span::styled(&app.new_stage, stage_style),
+            Span::styled("  Path:  ", label_style(1)),
+            path_val,
+        ]),
+        Line::from(vec![
+            Span::styled("  Stage: ", label_style(2)),
+            Span::styled(&app.new_stage, field_style(2)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("      "),
+            Span::styled(" Save ", save_style),
+            Span::raw("    "),
+            Span::styled(" Cancel ", cancel_style),
         ]),
         Line::from(""),
     ];
@@ -618,32 +689,62 @@ fn draw_new_entry_popup(frame: &mut Frame, app: &App) {
 }
 
 fn draw_copy_popup(frame: &mut Frame, app: &App) {
-    let area = centered_rect(50, 35, frame.area());
+    let area = centered_rect_abs(50, 13, frame.area());
     frame.render_widget(Clear, area);
 
     let Some(entry) = app.selected_entry() else { return; };
 
-    let path_style = if app.copy_field == 0 { Style::default().fg(ACCENT) } else { Style::default() };
-    let stage_style = if app.copy_field == 1 { Style::default().fg(ACCENT) } else { Style::default() };
+    let field_style = |f: usize| {
+        if app.copy_field == f {
+            Style::default().fg(ACCENT).bg(Color::DarkGray)
+        } else {
+            Style::default()
+        }
+    };
+    let label_style = |f: usize| {
+        if app.copy_field == f {
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(DIM)
+        }
+    };
+
+    let save_style = if app.copy_field == 2 && app.copy_save {
+        Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(DIM)
+    };
+    let cancel_style = if app.copy_field == 2 && !app.copy_save {
+        Style::default().fg(Color::Black).bg(Color::Red).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(DIM)
+    };
 
     let lines = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled("From:  ", Style::default().fg(DIM)),
-            Span::raw(format!("{} [{}]", entry.path, entry.stage)),
+            Span::styled("  From:  ", Style::default().fg(DIM)),
+            Span::raw(format!("{} {} [{}]", entry.id, entry.display_name(), entry.stage)),
         ]),
         Line::from(vec![
-            Span::styled("Vars:  ", Style::default().fg(DIM)),
+            Span::styled("  Vars:  ", Style::default().fg(DIM)),
             Span::raw(format!("{} keys", entry.vars.len())),
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("Path:  ", Style::default().fg(DIM)),
-            Span::styled(&app.copy_path, path_style),
+            Span::styled("  Path:  ", label_style(0)),
+            Span::styled(&app.copy_path, field_style(0)),
         ]),
         Line::from(vec![
-            Span::styled("Stage: ", Style::default().fg(DIM)),
-            Span::styled(&app.copy_stage, stage_style),
+            Span::styled("  Stage: ", label_style(1)),
+            Span::styled(&app.copy_stage, field_style(1)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("      "),
+            Span::styled(" Copy ", save_style),
+            Span::raw("    "),
+            Span::styled(" Cancel ", cancel_style),
         ]),
         Line::from(""),
     ];
@@ -651,6 +752,75 @@ fn draw_copy_popup(frame: &mut Frame, app: &App) {
     let popup = Paragraph::new(lines).block(
         Block::default()
             .title(" Copy ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(ACCENT)),
+    );
+    frame.render_widget(popup, area);
+}
+
+fn draw_edit_meta_popup(frame: &mut Frame, app: &App) {
+    let area = centered_rect_abs(50, 12, frame.area());
+    frame.render_widget(Clear, area);
+
+    let field_style = |f: usize| {
+        if app.meta_field == f {
+            Style::default().fg(ACCENT).bg(Color::DarkGray)
+        } else {
+            Style::default()
+        }
+    };
+    let label_style = |f: usize| {
+        if app.meta_field == f {
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(DIM)
+        }
+    };
+
+    let save_style = if app.meta_field == 3 && app.meta_save {
+        Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(DIM)
+    };
+    let cancel_style = if app.meta_field == 3 && !app.meta_save {
+        Style::default().fg(Color::Black).bg(Color::Red).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(DIM)
+    };
+
+    let name_val = if app.meta_name.is_empty() && app.meta_field != 0 {
+        Span::styled("(optional)", Style::default().fg(DIM))
+    } else {
+        Span::styled(&app.meta_name, field_style(0))
+    };
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Name:  ", label_style(0)),
+            name_val,
+        ]),
+        Line::from(vec![
+            Span::styled("  Path:  ", label_style(1)),
+            Span::styled(&app.meta_path, field_style(1)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Stage: ", label_style(2)),
+            Span::styled(&app.meta_stage, field_style(2)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("      "),
+            Span::styled(" Save ", save_style),
+            Span::raw("    "),
+            Span::styled(" Cancel ", cancel_style),
+        ]),
+        Line::from(""),
+    ];
+
+    let popup = Paragraph::new(lines).block(
+        Block::default()
+            .title(" Rename / Move ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(ACCENT)),
     );
@@ -667,22 +837,3 @@ fn centered_rect_abs(width: u16, height: u16, area: Rect) -> Rect {
     Rect::new(x, y, w, h)
 }
 
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(vertical[1])[1]
-}
