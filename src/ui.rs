@@ -117,11 +117,11 @@ fn draw_message_bar(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_keys_bar(frame: &mut Frame, app: &App, area: Rect) {
     let keys = match &app.view {
-        View::Editor => "Paste: Ctrl+Shift+V │ Esc: speichern │ Ctrl+Q: verwerfen",
-        View::Delete => "[J/Y]: loeschen  [N/Esc]: abbrechen",
-        View::NewEntry | View::Copy => "Tab: Feld wechseln │ Enter: bestaetigen │ Esc: abbrechen",
+        View::Editor => "Paste: Ctrl+Shift+V │ Esc: save │ Ctrl+Q: discard",
+        View::Delete => "←→ select │ Y/N │ Enter confirm │ Esc cancel",
+        View::NewEntry | View::Copy => "Tab: switch field │ Enter: confirm │ Esc: cancel",
         View::Tabs => match app.active_tab {
-            Tab::Import => "↑↓ nav │ Space an/aus │ Enter importieren │ Tab Store │ Esc quit",
+            Tab::Import => "↑↓ nav │ Space toggle │ Enter import │ Tab Store │ Esc quit",
             Tab::Store => "[E]dit │ [D]elete │ [C]opy │ [S]how │ [N]ew │ [I]mport │ Tab Import │ Esc quit",
         },
     };
@@ -147,11 +147,12 @@ fn draw_import_file_list(frame: &mut Frame, app: &mut App, area: Rect) {
             .title(" .env Dateien ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(ACCENT));
-        let empty = Paragraph::new("Keine .env* Dateien gefunden.").block(block);
+        let empty = Paragraph::new("No .env* files found.").block(block);
         frame.render_widget(empty, area);
         return;
     }
 
+    let cwd = &app.cwd;
     let items: Vec<ListItem> = app
         .import_candidates
         .iter()
@@ -161,10 +162,26 @@ fn draw_import_file_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
 
+            let existing_id = app.entries.iter()
+                .find(|e| e.path == *cwd && e.stage == c.stage)
+                .map(|e| e.id.clone());
+
             let (status_label, status_color) = match c.status {
-                ImportStatus::New => ("neu", Color::Green),
-                ImportStatus::Changed => ("upd", Color::Yellow),
-                ImportStatus::Unchanged => ("=", DIM),
+                ImportStatus::New => ("neu".to_string(), Color::Green),
+                ImportStatus::Changed => {
+                    let label = match &existing_id {
+                        Some(id) => format!("upd {id}"),
+                        None => "upd".to_string(),
+                    };
+                    (label, Color::Yellow)
+                }
+                ImportStatus::Unchanged => {
+                    let label = match &existing_id {
+                        Some(id) => format!("= {id}"),
+                        None => "=".to_string(),
+                    };
+                    (label, DIM)
+                }
             };
 
             let warn = if c.perm_warn { " ⚠" } else { "" };
@@ -225,20 +242,36 @@ fn draw_import_diff(frame: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Header
+    // Header: file name, stage, and existing entry info
     let file_name = candidate.file.file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
-    let header_area = Rect::new(inner.x, inner.y, inner.width, 2);
-    let diff_area = Rect::new(inner.x, inner.y + 2, inner.width, inner.height.saturating_sub(2));
 
-    let header = Paragraph::new(vec![
+    // Check if entry exists in keyring
+    let existing = app.entries.iter().find(|e| e.path == app.cwd && e.stage == candidate.stage);
+
+    let header_height: u16 = if existing.is_some() { 4 } else { 2 };
+    let header_area = Rect::new(inner.x, inner.y, inner.width, header_height);
+    let diff_area = Rect::new(inner.x, inner.y + header_height, inner.width, inner.height.saturating_sub(header_height));
+
+    let mut header_lines = vec![
         Line::from(vec![
             Span::styled(&file_name, Style::default().add_modifier(Modifier::BOLD)),
             Span::styled(format!(" → [{}]", candidate.stage), Style::default().fg(DIM)),
         ]),
-        Line::from(""),
-    ]);
+    ];
+
+    if let Some(entry) = existing {
+        header_lines.push(Line::from(vec![
+            Span::styled("Loaded: ", Style::default().fg(DIM)),
+            Span::styled(&entry.id, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  {} keys  updated {}", entry.vars.len(), keyring::relative_time(entry.updated_at)), Style::default().fg(DIM)),
+        ]));
+    }
+
+    header_lines.push(Line::from(""));
+
+    let header = Paragraph::new(header_lines);
     frame.render_widget(header, header_area);
 
     if diff.is_empty() {
@@ -424,11 +457,11 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw(entry.vars.len().to_string()),
         ]),
         Line::from(vec![
-            Span::styled("Erstellt:  ", Style::default().fg(DIM)),
+            Span::styled("Created: ", Style::default().fg(DIM)),
             Span::raw(keyring::relative_time(entry.created_at)),
         ]),
         Line::from(vec![
-            Span::styled("Geaendert: ", Style::default().fg(DIM)),
+            Span::styled("Updated: ", Style::default().fg(DIM)),
             Span::raw(keyring::relative_time(entry.updated_at)),
         ]),
     ]);
@@ -477,7 +510,7 @@ fn draw_editor(frame: &mut Frame, app: &mut App) {
         " Editor ".to_string()
     };
     let header = Paragraph::new(
-        "  Format: KEY=VALUE (eine Zeile pro Variable, Paste mit Ctrl+Shift+V)",
+        "  Format: KEY=VALUE (one per line, paste with Ctrl+Shift+V)",
     )
     .block(
         Block::default()
@@ -501,29 +534,47 @@ fn draw_editor(frame: &mut Frame, app: &mut App) {
 // --- Popups (Store sub-views) ---
 
 fn draw_delete_popup(frame: &mut Frame, app: &App) {
-    let area = centered_rect_abs(45, 9, frame.area());
+    let area = centered_rect_abs(45, 11, frame.area());
     frame.render_widget(Clear, area);
 
     let Some(entry) = app.selected_entry() else { return; };
 
+    let yes_style = if app.delete_yes {
+        Style::default().fg(Color::Black).bg(Color::Red).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(DIM)
+    };
+    let no_style = if !app.delete_yes {
+        Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(DIM)
+    };
+
     let lines = vec![
         Line::from(""),
         Line::from(Span::styled(
-            "Eintrag loeschen?",
+            "Delete entry?",
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(vec![
-            Span::styled("Path:  ", Style::default().fg(DIM)),
+            Span::styled("  Path:  ", Style::default().fg(DIM)),
             Span::raw(&entry.path),
         ]),
         Line::from(vec![
-            Span::styled("Stage: ", Style::default().fg(DIM)),
+            Span::styled("  Stage: ", Style::default().fg(DIM)),
             Span::raw(&entry.stage),
         ]),
         Line::from(vec![
-            Span::styled("Keys:  ", Style::default().fg(DIM)),
+            Span::styled("  Keys:  ", Style::default().fg(DIM)),
             Span::raw(entry.vars.len().to_string()),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("      "),
+            Span::styled(" Yes ", yes_style),
+            Span::raw("    "),
+            Span::styled(" No ", no_style),
         ]),
         Line::from(""),
     ];

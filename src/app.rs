@@ -99,8 +99,8 @@ pub struct App<'a> {
     pub new_path: String,
     pub new_stage: String,
     pub new_field: usize,
-    // Delete confirmation
-    pub delete_confirm: bool,
+    // Delete confirmation (true = Yes selected, false = No selected)
+    pub delete_yes: bool,
     // Copy state
     pub copy_path: String,
     pub copy_stage: String,
@@ -136,7 +136,7 @@ impl<'a> App<'a> {
             new_path: String::new(),
             new_stage: "default".to_string(),
             new_field: 0,
-            delete_confirm: false,
+            delete_yes: false,
             copy_path: String::new(),
             copy_stage: "default".to_string(),
             copy_field: 0,
@@ -181,7 +181,7 @@ impl<'a> App<'a> {
     }
 
     pub fn enter_delete(&mut self) {
-        self.delete_confirm = false;
+        self.delete_yes = false;
         self.view = View::Delete;
     }
 
@@ -282,7 +282,7 @@ impl<'a> App<'a> {
                 let mode = c.file.metadata()
                     .map(|m| format!("{:o}", m.permissions().mode() & 0o777))
                     .unwrap_or_default();
-                self.msg(MsgKind::Warning, format!("{name} ist fuer andere lesbar (mode: {mode}). chmod 600 empfohlen"));
+                self.msg(MsgKind::Warning, format!("{name} is world-readable (mode: {mode}). chmod 600 recommended"));
             } else {
                 self.message = None;
             }
@@ -460,7 +460,7 @@ async fn handle_import_select(app: &mut App<'_>, key: event::KeyEvent) -> Result
             }
 
             if count == 0 {
-                app.msg(MsgKind::Warning, "Nichts ausgewaehlt");
+                app.msg(MsgKind::Warning, "Nothing selected");
             } else {
                 app.entries = app.keyring.load_all_entries().await?;
 
@@ -471,7 +471,7 @@ async fn handle_import_select(app: &mut App<'_>, key: event::KeyEvent) -> Result
                 }
 
                 let id_list = ids.join(", ");
-                app.msg(MsgKind::Success, format!("{count} importiert [{}]", id_list));
+                app.msg(MsgKind::Success, format!("{count} imported [{}]", id_list));
                 app.active_tab = Tab::Store;
             }
         }
@@ -548,7 +548,7 @@ async fn handle_editor_input(app: &mut App<'_>, key: event::KeyEvent) -> Result<
         }
         if !bad_lines.is_empty() {
             let nums: Vec<String> = bad_lines.iter().map(|n| n.to_string()).collect();
-            app.msg(MsgKind::Error, format!("Zeile {} hat kein KEY=VALUE Format", nums.join(", ")));
+            app.msg(MsgKind::Error, format!("Line {} is not KEY=VALUE format", nums.join(", ")));
             return Ok(());
         }
 
@@ -562,7 +562,7 @@ async fn handle_editor_input(app: &mut App<'_>, key: event::KeyEvent) -> Result<
             if let Some(e) = app.entries.get_mut(idx) {
                 e.vars = vars;
             }
-            app.msg(MsgKind::Success, "Gespeichert");
+            app.msg(MsgKind::Success, "Saved");
         }
         app.view = View::Tabs;
         return Ok(());
@@ -577,23 +577,25 @@ async fn handle_editor_input(app: &mut App<'_>, key: event::KeyEvent) -> Result<
 async fn handle_delete_input(app: &mut App<'_>, key: event::KeyEvent) -> Result<()> {
     match key.code {
         KeyCode::Esc => app.view = View::Tabs,
-        KeyCode::Char('j') | KeyCode::Char('y') => {
-            let idx = app.selected_index();
-            if let Some(entry) = app.entries.get(idx) {
-                let path = entry.path.clone();
-                let stage = entry.stage.clone();
-                app.keyring.delete_entry(&path, &stage).await?;
-                app.entries = app.keyring.load_all_entries().await?;
-                if idx >= app.entries.len() && idx > 0 {
-                    app.store_list_state.select(Some(idx - 1));
-                } else if app.entries.is_empty() {
-                    app.store_list_state.select(None);
+        KeyCode::Left | KeyCode::Right => app.delete_yes = !app.delete_yes,
+        KeyCode::Char('y') | KeyCode::Char('j') => app.delete_yes = true,
+        KeyCode::Char('n') => app.delete_yes = false,
+        KeyCode::Enter => {
+            if app.delete_yes {
+                let idx = app.selected_index();
+                if let Some(entry) = app.entries.get(idx) {
+                    let path = entry.path.clone();
+                    let stage = entry.stage.clone();
+                    app.keyring.delete_entry(&path, &stage).await?;
+                    app.entries = app.keyring.load_all_entries().await?;
+                    if idx >= app.entries.len() && idx > 0 {
+                        app.store_list_state.select(Some(idx - 1));
+                    } else if app.entries.is_empty() {
+                        app.store_list_state.select(None);
+                    }
+                    app.msg(MsgKind::Success, "Deleted");
                 }
-                app.msg(MsgKind::Success, "Geloescht");
             }
-            app.view = View::Tabs;
-        }
-        KeyCode::Char('n') => {
             app.view = View::Tabs;
         }
         _ => {}
@@ -615,7 +617,7 @@ async fn handle_new_entry_input(app: &mut App<'_>, key: event::KeyEvent) -> Resu
                 if let Some(i) = pos {
                     app.store_list_state.select(Some(i));
                 }
-                app.msg(MsgKind::Success, "Erstellt");
+                app.msg(MsgKind::Success, "Created");
                 app.view = View::Tabs;
                 app.enter_editor();
             }
@@ -647,7 +649,7 @@ async fn handle_copy_input(app: &mut App<'_>, key: event::KeyEvent) -> Result<()
                     if let Some(i) = pos {
                         app.store_list_state.select(Some(i));
                     }
-                    app.msg(MsgKind::Success, "Kopiert");
+                    app.msg(MsgKind::Success, "Copied");
                 }
                 app.view = View::Tabs;
             }

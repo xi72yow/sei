@@ -1,4 +1,4 @@
-# sei — Save Env Inject
+# sei - Save Env Inject
 
 Manages environment secrets in GNOME Keyring instead of `.env` files. TUI for editing, CLI for injection.
 

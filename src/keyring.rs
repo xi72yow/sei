@@ -27,13 +27,13 @@ pub fn relative_time(timestamp: u64) -> String {
     let now = unix_now();
     let diff = now.saturating_sub(timestamp);
     if diff < 60 {
-        "gerade eben".to_string()
+        "just now".to_string()
     } else if diff < 3600 {
-        format!("vor {} Min", diff / 60)
+        format!("{}m ago", diff / 60)
     } else if diff < 86400 {
-        format!("vor {} Std", diff / 3600)
+        format!("{}h ago", diff / 3600)
     } else {
-        format!("vor {} Tagen", diff / 86400)
+        format!("{}d ago", diff / 86400)
     }
 }
 
@@ -463,10 +463,10 @@ mod tests {
     fn test_relative_time() {
         assert_eq!(relative_time(0), "–");
         let now = unix_now();
-        assert_eq!(relative_time(now), "gerade eben");
-        assert_eq!(relative_time(now - 120), "vor 2 Min");
-        assert_eq!(relative_time(now - 7200), "vor 2 Std");
-        assert_eq!(relative_time(now - 172800), "vor 2 Tagen");
+        assert_eq!(relative_time(now), "just now");
+        assert_eq!(relative_time(now - 120), "2m ago");
+        assert_eq!(relative_time(now - 7200), "2h ago");
+        assert_eq!(relative_time(now - 172800), "2d ago");
     }
 
     #[tokio::test]
