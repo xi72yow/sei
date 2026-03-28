@@ -14,6 +14,7 @@ ratatui-textarea = "0.8.0"
 crossterm = "0.29.0"
 clap = { version = "4.6.0", features = ["derive"] }
 anyhow = "1.0.102"
+futures-util = "0.3"
 base64 = "0.22"
 
 [profile.release]

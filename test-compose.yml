@@ -1,0 +1,11 @@
+services:
+  test:
+    image: docker.io/library/alpine:latest
+    command: ["sh", "-c", "echo 'DB=$DB_HOST:$DB_PORT user=$DB_USER' && echo '---' && env | sort"]
+    environment:
+      - DB_HOST
+      - DB_PORT
+      - DB_USER
+      - DB_PASS
+      - API_KEY
+      - REDIS_URL

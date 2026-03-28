@@ -3,7 +3,6 @@ mod keyring;
 mod ui;
 
 use clap::{Parser, Subcommand};
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -15,17 +14,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Import a .env file into the keyring
-    Import {
-        /// Path to .env file (default: .env in current directory)
-        #[arg(short, long)]
-        file: Option<PathBuf>,
-
-        /// Stage name (default: "default")
-        #[arg(short, long, default_value = "default")]
-        stage: String,
-    },
-
     /// Run a command with injected env vars (headless)
     Run {
         /// Stage name
@@ -36,6 +24,10 @@ enum Command {
         #[arg(short, long)]
         path: Option<PathBuf>,
 
+        /// Entry ID (3-digit, e.g. 001)
+        #[arg(short, long)]
+        id: Option<String>,
+
         /// Command and arguments to execute
         #[arg(trailing_var_arg = true, required = true)]
         cmd: Vec<String>,
@@ -44,58 +36,37 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // ID shorthand: sei 001 cmd args...
+    if args.len() >= 2 {
+        if let Some(id) = args.first() {
+            if id.len() == 3 && id.chars().all(|c| c.is_ascii_digit()) {
+                let cmd = &args[1..];
+                return run_with_id(id, cmd).await;
+            }
+        }
+    }
+
     let cli = Cli::parse();
 
     match cli.command {
         None => {
-            // TUI Dashboard
             app::run_tui().await?;
         }
-        Some(Command::Import { file, stage }) => {
-            let env_file = file.unwrap_or_else(|| PathBuf::from(".env"));
-            let path = std::env::current_dir()?;
-
-            // Warn if .env file is group/world readable
-            if let Ok(metadata) = env_file.metadata() {
-                let mode = metadata.permissions().mode();
-                if mode & 0o077 != 0 {
-                    eprintln!(
-                        "Warnung: {} ist fuer andere lesbar (mode: {:o}). Empfohlen: chmod 600",
-                        env_file.display(),
-                        mode & 0o777
-                    );
-                }
-            }
-
-            keyring::import_env_file(&env_file, &path.to_string_lossy(), &stage).await?;
-            println!("Importiert in Keyring [{}]", stage);
-
-            // Ask to delete the .env file
-            eprint!(
-                "{} loeschen? Die Secrets sind jetzt sicher im Keyring. [j/N] ",
-                env_file.display()
-            );
-            let mut input = String::new();
-            std::io::stdin().read_line(&mut input)?;
-            if input.trim().eq_ignore_ascii_case("j") {
-                std::fs::remove_file(&env_file)?;
-                println!("{} geloescht.", env_file.display());
+        Some(Command::Run { stage, path, id, cmd }) => {
+            let envs = if let Some(id) = id {
+                keyring::load_envs_by_id(&id).await?
             } else {
-                eprintln!(
-                    "Hinweis: {} existiert noch — Secrets sind weiterhin als Datei lesbar.",
-                    env_file.display()
-                );
-            }
-        }
-        Some(Command::Run { stage, path, cmd }) => {
-            let path = match path {
-                Some(p) => std::fs::canonicalize(p)?,
-                None => std::env::current_dir()?,
+                let path = match path {
+                    Some(p) => std::fs::canonicalize(p)?,
+                    None => std::env::current_dir()?,
+                };
+                keyring::load_envs(&path.to_string_lossy(), &stage).await?
             };
-            let envs = keyring::load_envs(&path.to_string_lossy(), &stage).await?;
 
             if envs.is_empty() {
-                eprintln!("No env vars found for {} [{}]", path.display(), stage);
+                eprintln!("No env vars found");
                 std::process::exit(1);
             }
 
@@ -109,4 +80,20 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+async fn run_with_id(id: &str, cmd: &[String]) -> anyhow::Result<()> {
+    let envs = keyring::load_envs_by_id(id).await?;
+
+    if envs.is_empty() {
+        eprintln!("No env vars found for ID {id}");
+        std::process::exit(1);
+    }
+
+    let status = tokio::process::Command::new(&cmd[0])
+        .args(&cmd[1..])
+        .envs(envs)
+        .status()
+        .await?;
+    std::process::exit(status.code().unwrap_or(1));
 }

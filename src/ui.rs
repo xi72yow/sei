@@ -1,62 +1,314 @@
-use crate::app::{App, ConfirmAction, View};
+use crate::app::{App, DiffKind, ImportStatus, MsgKind, Tab, View};
+use crate::keyring;
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Row, Table};
+use ratatui::widgets::{
+    Block, Borders, Clear, List, ListItem, Paragraph, Row, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Table, Tabs,
+};
 
 const ACCENT: Color = Color::Magenta;
 const DIM: Color = Color::DarkGray;
 
+// --- Top-level draw ---
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
     match &app.view {
-        View::Dashboard => draw_dashboard(frame, app),
+        View::Tabs => draw_tabs(frame, app),
         View::Editor => draw_editor(frame, app),
         View::Delete => {
-            draw_dashboard(frame, app);
+            draw_tabs(frame, app);
             draw_delete_popup(frame, app);
         }
         View::NewEntry => {
-            draw_dashboard(frame, app);
+            draw_tabs(frame, app);
             draw_new_entry_popup(frame, app);
         }
         View::Copy => {
-            draw_dashboard(frame, app);
+            draw_tabs(frame, app);
             draw_copy_popup(frame, app);
-        }
-        View::Confirm(action) => {
-            match action {
-                ConfirmAction::Save => draw_editor(frame, app),
-                ConfirmAction::Copy => {
-                    draw_dashboard(frame, app);
-                    draw_copy_popup(frame, app);
-                }
-                ConfirmAction::Import => draw_dashboard(frame, app),
-            }
-            draw_confirm_popup(frame, app, &app.view.clone());
         }
     }
 }
 
-fn draw_dashboard(frame: &mut Frame, app: &App) {
+// --- Tab layout ---
+
+fn draw_tabs(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1), // Tab bar
+            Constraint::Min(1),   // Content
+            Constraint::Length(1), // Message
+            Constraint::Length(1), // Keys
+        ])
         .split(area);
 
-    let main = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-        .split(chunks[0]);
+    draw_tab_bar(frame, app, chunks[0]);
 
-    draw_project_list(frame, app, main[0]);
-    draw_details(frame, app, main[1]);
-    draw_status_bar(frame, app, chunks[1]);
+    match app.active_tab {
+        Tab::Import => draw_import_tab(frame, app, chunks[1]),
+        Tab::Store => draw_store_tab(frame, app, chunks[1]),
+    }
+
+    draw_message_bar(frame, app, chunks[2]);
+    draw_keys_bar(frame, app, chunks[3]);
 }
 
-/// Kuerzt einen Pfad auf den letzten Ordnernamen
+fn draw_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
+    // Badge for actionable imports
+    let actionable = app
+        .import_candidates
+        .iter()
+        .filter(|c| c.status != ImportStatus::Unchanged)
+        .count();
+    let import_title = if actionable > 0 {
+        format!("Import ({actionable})")
+    } else {
+        "Import".to_string()
+    };
+
+    let titles = vec![import_title, "Store".to_string()];
+    let selected = match app.active_tab {
+        Tab::Import => 0,
+        Tab::Store => 1,
+    };
+
+    // Layout: tabs left, cwd right
+    let tab_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(1), Constraint::Length(app.cwd.len() as u16 + 2)])
+        .split(area);
+
+    let tabs = Tabs::new(titles)
+        .select(selected)
+        .style(Style::default().fg(DIM))
+        .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
+        .divider("│");
+
+    frame.render_widget(tabs, tab_chunks[0]);
+
+    let cwd_display = &app.cwd;
+    let cwd_para = Paragraph::new(Span::styled(cwd_display, Style::default().fg(DIM)))
+        .alignment(Alignment::Right);
+    frame.render_widget(cwd_para, tab_chunks[1]);
+}
+
+fn draw_message_bar(frame: &mut Frame, app: &App, area: Rect) {
+    let para = if let Some((ref kind, ref text)) = app.message {
+        let (icon, color) = match kind {
+            MsgKind::Success => ("✓ ", Color::Green),
+            MsgKind::Warning => ("⚠ ", Color::Yellow),
+            MsgKind::Error => ("✗ ", Color::Red),
+        };
+        Paragraph::new(Line::from(vec![
+            Span::styled(icon, Style::default().fg(color)),
+            Span::styled(text.as_str(), Style::default().fg(color)),
+        ]))
+    } else {
+        Paragraph::new("")
+    };
+    frame.render_widget(para, area);
+}
+
+fn draw_keys_bar(frame: &mut Frame, app: &App, area: Rect) {
+    let keys = match &app.view {
+        View::Editor => "Paste: Ctrl+Shift+V │ Esc: speichern │ Ctrl+Q: verwerfen",
+        View::Delete => "[J/Y]: loeschen  [N/Esc]: abbrechen",
+        View::NewEntry | View::Copy => "Tab: Feld wechseln │ Enter: bestaetigen │ Esc: abbrechen",
+        View::Tabs => match app.active_tab {
+            Tab::Import => "↑↓ nav │ Space an/aus │ Enter importieren │ Tab Store │ Esc quit",
+            Tab::Store => "[E]dit │ [D]elete │ [C]opy │ [S]how │ [N]ew │ [I]mport │ Tab Import │ Esc quit",
+        },
+    };
+    let bar = Paragraph::new(keys).style(Style::default().fg(DIM));
+    frame.render_widget(bar, area);
+}
+
+// --- Import tab ---
+
+fn draw_import_tab(frame: &mut Frame, app: &mut App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(area);
+
+    draw_import_file_list(frame, app, chunks[0]);
+    draw_import_diff(frame, app, chunks[1]);
+}
+
+fn draw_import_file_list(frame: &mut Frame, app: &mut App, area: Rect) {
+    if app.import_candidates.is_empty() {
+        let block = Block::default()
+            .title(" .env Dateien ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(ACCENT));
+        let empty = Paragraph::new("Keine .env* Dateien gefunden.").block(block);
+        frame.render_widget(empty, area);
+        return;
+    }
+
+    let items: Vec<ListItem> = app
+        .import_candidates
+        .iter()
+        .map(|c| {
+            let checkbox = if c.selected { "[x]" } else { "[ ]" };
+            let name = c.file.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            let (status_label, status_color) = match c.status {
+                ImportStatus::New => ("neu", Color::Green),
+                ImportStatus::Changed => ("upd", Color::Yellow),
+                ImportStatus::Unchanged => ("=", DIM),
+            };
+
+            let warn = if c.perm_warn { " ⚠" } else { "" };
+
+            let style = if c.selected {
+                Style::default()
+            } else {
+                Style::default().fg(DIM)
+            };
+
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{checkbox} {name}"), style),
+                Span::styled(format!(" ({status_label})"), Style::default().fg(status_color)),
+                Span::styled(warn, Style::default().fg(Color::Yellow)),
+            ]))
+        })
+        .collect();
+
+    let count = app.import_candidates.len();
+    let title = format!(" .env Dateien ({count}) ");
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(ACCENT)),
+        )
+        .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
+        .highlight_symbol("▸ ");
+
+    frame.render_stateful_widget(list, area, &mut app.import_list_state);
+
+    // Scrollbar
+    if count > area.height.saturating_sub(2) as usize {
+        let mut scrollbar_state = ScrollbarState::new(count)
+            .position(app.import_list_state.selected().unwrap_or(0));
+        let scrollbar = Scrollbar::default()
+            .orientation(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None);
+        frame.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
+    }
+}
+
+fn draw_import_diff(frame: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .title(" Diff ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT));
+
+    let Some(candidate) = app.selected_import() else {
+        frame.render_widget(Paragraph::new("").block(block), area);
+        return;
+    };
+
+    let diff = app.current_diff();
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Header
+    let file_name = candidate.file.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let header_area = Rect::new(inner.x, inner.y, inner.width, 2);
+    let diff_area = Rect::new(inner.x, inner.y + 2, inner.width, inner.height.saturating_sub(2));
+
+    let header = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled(&file_name, Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" → [{}]", candidate.stage), Style::default().fg(DIM)),
+        ]),
+        Line::from(""),
+    ]);
+    frame.render_widget(header, header_area);
+
+    if diff.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled("(leer)", Style::default().fg(DIM))),
+            diff_area,
+        );
+        return;
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
+    for d in &diff {
+        match d.kind {
+            DiffKind::Added => {
+                lines.push(Line::from(Span::styled(
+                    format!("+ {}={}", d.key, d.new_val.as_deref().unwrap_or("")),
+                    Style::default().fg(Color::Green),
+                )));
+            }
+            DiffKind::Removed => {
+                lines.push(Line::from(Span::styled(
+                    format!("- {}={}", d.key, d.old_val.as_deref().unwrap_or("")),
+                    Style::default().fg(Color::Red),
+                )));
+            }
+            DiffKind::Changed => {
+                lines.push(Line::from(Span::styled(
+                    format!("- {}={}", d.key, d.old_val.as_deref().unwrap_or("")),
+                    Style::default().fg(Color::Red),
+                )));
+                lines.push(Line::from(Span::styled(
+                    format!("+ {}={}", d.key, d.new_val.as_deref().unwrap_or("")),
+                    Style::default().fg(Color::Green),
+                )));
+            }
+            DiffKind::Unchanged => {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}={}", d.key, d.new_val.as_deref().unwrap_or("")),
+                    Style::default().fg(DIM),
+                )));
+            }
+        }
+    }
+
+    let total_lines = lines.len();
+    frame.render_widget(Paragraph::new(lines), diff_area);
+
+    // Scrollbar for diff
+    if total_lines > diff_area.height as usize {
+        let mut scrollbar_state = ScrollbarState::new(total_lines).position(0);
+        let scrollbar = Scrollbar::default()
+            .orientation(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None);
+        frame.render_stateful_widget(scrollbar, diff_area, &mut scrollbar_state);
+    }
+}
+
+// --- Store tab ---
+
+fn draw_store_tab(frame: &mut Frame, app: &mut App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(area);
+
+    draw_project_list(frame, app, chunks[0]);
+    draw_details(frame, app, chunks[1]);
+}
+
 fn short_path(path: &str) -> &str {
     std::path::Path::new(path)
         .file_name()
@@ -64,8 +316,6 @@ fn short_path(path: &str) -> &str {
         .unwrap_or(path)
 }
 
-/// Marquee/Ticker: scrollt Text hin und her wenn er nicht reinpasst
-/// Pausiert am Anfang und Ende fuer einige Sekunden
 fn ticker(text: &str, width: usize, tick: usize) -> String {
     let text_len = text.chars().count();
     if text_len <= width || width == 0 {
@@ -73,53 +323,64 @@ fn ticker(text: &str, width: usize, tick: usize) -> String {
     }
 
     let max_offset = text_len - width;
-    let pause = 20; // ~2 Sekunden Pause am Anfang/Ende (20 * 100ms)
-    let scroll_steps = max_offset * 3; // alle 3 Ticks ein Zeichen
+    let pause = 20;
+    let scroll_steps = max_offset * 3;
     let cycle = pause + scroll_steps + pause + scroll_steps;
     let pos = tick % cycle;
 
     let offset = if pos < pause {
-        // Pause am Anfang
         0
     } else if pos < pause + scroll_steps {
-        // Scroll vorwaerts
         (pos - pause) / 3
     } else if pos < pause + scroll_steps + pause {
-        // Pause am Ende
         max_offset
     } else {
-        // Scroll rueckwaerts
         max_offset - (pos - pause - scroll_steps - pause) / 3
     };
 
     text.chars().skip(offset).take(width).collect()
 }
 
-fn draw_project_list(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_project_list(frame: &mut Frame, app: &mut App, area: Rect) {
+    let cwd = &app.cwd;
+
     let items: Vec<ListItem> = app
         .entries
         .iter()
-        .enumerate()
-        .map(|(i, entry)| {
-            let style = if i == app.selected {
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
-            let marker = if i == app.selected { "▸ " } else { "  " };
-            let text = format!("{}{} [{}]", marker, short_path(&entry.path), entry.stage);
+        .map(|entry| {
+            let is_cwd = entry.path == *cwd;
+            let mut style = Style::default();
+            if is_cwd {
+                style = style.fg(Color::Cyan);
+            }
+            let text = format!("{} {} [{}]", entry.id, short_path(&entry.path), entry.stage);
             ListItem::new(text).style(style)
         })
         .collect();
 
-    let list = List::new(items).block(
-        Block::default()
-            .title(" Projects ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(ACCENT)),
-    );
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title(" Projects ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(ACCENT)),
+        )
+        .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
+        .highlight_symbol("▸ ");
 
-    frame.render_widget(list, area);
+    frame.render_stateful_widget(list, area, &mut app.store_list_state);
+
+    // Scrollbar
+    let count = app.entries.len();
+    if count > area.height.saturating_sub(2) as usize {
+        let mut scrollbar_state = ScrollbarState::new(count)
+            .position(app.store_list_state.selected().unwrap_or(0));
+        let scrollbar = Scrollbar::default()
+            .orientation(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None);
+        frame.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
+    }
 }
 
 fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
@@ -139,14 +400,17 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
 
     let detail_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .constraints([Constraint::Length(6), Constraint::Min(1)])
         .split(inner);
 
-    // Verfuegbare Breite fuer den Pfad (abzgl. "Path:  " = 7 Zeichen)
     let path_width = detail_chunks[0].width.saturating_sub(7) as usize;
     let path_display = ticker(&entry.path, path_width, app.tick);
 
     let header = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("ID:    ", Style::default().fg(DIM)),
+            Span::styled(&entry.id, Style::default().add_modifier(Modifier::BOLD)),
+        ]),
         Line::from(vec![
             Span::styled("Path:  ", Style::default().fg(DIM)),
             Span::raw(path_display),
@@ -158,6 +422,14 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(vec![
             Span::styled("Keys:  ", Style::default().fg(DIM)),
             Span::raw(entry.vars.len().to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("Erstellt:  ", Style::default().fg(DIM)),
+            Span::raw(keyring::relative_time(entry.created_at)),
+        ]),
+        Line::from(vec![
+            Span::styled("Geaendert: ", Style::default().fg(DIM)),
+            Span::raw(keyring::relative_time(entry.updated_at)),
         ]),
     ]);
     frame.render_widget(header, detail_chunks[0]);
@@ -184,16 +456,7 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(table, detail_chunks[1]);
 }
 
-fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let msg = if let Some(ref status) = app.status_msg {
-        status.clone()
-    } else {
-        "[E]dit  [D]elete  [C]opy  [S]how/hide  [N]ew  [I]mport .env  [Q]uit".to_string()
-    };
-
-    let bar = Paragraph::new(msg).style(Style::default().fg(DIM));
-    frame.render_widget(bar, area);
-}
+// --- Editor ---
 
 fn draw_editor(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
@@ -203,26 +466,27 @@ fn draw_editor(frame: &mut Frame, app: &mut App) {
         .constraints([
             Constraint::Length(3),
             Constraint::Min(1),
-            Constraint::Length(1),
+            Constraint::Length(1), // Message
+            Constraint::Length(1), // Keys
         ])
         .split(area);
 
-    // Header
     let title = if let Some(entry) = app.selected_entry() {
         format!(" Editor: {} [{}] ", entry.path, entry.stage)
     } else {
         " Editor ".to_string()
     };
-    let header = Paragraph::new("  Format: KEY=VALUE (eine Zeile pro Variable, Paste mit Ctrl+Shift+V)")
-        .block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(ACCENT)),
-        );
+    let header = Paragraph::new(
+        "  Format: KEY=VALUE (eine Zeile pro Variable, Paste mit Ctrl+Shift+V)",
+    )
+    .block(
+        Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(ACCENT)),
+    );
     frame.render_widget(header, chunks[0]);
 
-    // Textarea
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(ACCENT));
@@ -230,29 +494,24 @@ fn draw_editor(frame: &mut Frame, app: &mut App) {
     app.editor.set_cursor_line_style(Style::default().bg(Color::DarkGray));
     frame.render_widget(&app.editor, chunks[1]);
 
-    // Help bar / Fehlermeldung
-    let (msg, style) = if let Some(ref status) = app.status_msg {
-        (status.clone(), Style::default().fg(Color::Red))
-    } else {
-        ("Paste: Ctrl+Shift+V  |  Esc: speichern  |  Ctrl+Q: verwerfen".to_string(), Style::default().fg(DIM))
-    };
-    let bar = Paragraph::new(msg).style(style);
-    frame.render_widget(bar, chunks[2]);
+    draw_message_bar(frame, app, chunks[2]);
+    draw_keys_bar(frame, app, chunks[3]);
 }
 
+// --- Popups (Store sub-views) ---
+
 fn draw_delete_popup(frame: &mut Frame, app: &App) {
-    let area = centered_rect(60, 40, frame.area());
+    let area = centered_rect_abs(45, 9, frame.area());
     frame.render_widget(Clear, area);
 
-    let Some(entry) = app.selected_entry() else {
-        return;
-    };
+    let Some(entry) = app.selected_entry() else { return; };
 
-    let key_list = entry.vars.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(", ");
-
-    let expected = format!("{} [{}]", entry.path, entry.stage);
-
-    let mut lines = vec![
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "Eintrag loeschen?",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
         Line::from(""),
         Line::from(vec![
             Span::styled("Path:  ", Style::default().fg(DIM)),
@@ -264,20 +523,10 @@ fn draw_delete_popup(frame: &mut Frame, app: &App) {
         ]),
         Line::from(vec![
             Span::styled("Keys:  ", Style::default().fg(DIM)),
-            Span::raw(&key_list),
+            Span::raw(entry.vars.len().to_string()),
         ]),
+        Line::from(""),
     ];
-    lines.push(Line::from(""));
-    lines.push(Line::from(format!("Type to confirm: {expected}")));
-    lines.push(Line::from(Span::styled(
-        format!("> {}", app.delete_input),
-        Style::default().fg(Color::Red),
-    )));
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "Esc: cancel",
-        Style::default().fg(DIM),
-    )));
 
     let popup = Paragraph::new(lines).block(
         Block::default()
@@ -285,7 +534,6 @@ fn draw_delete_popup(frame: &mut Frame, app: &App) {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Red)),
     );
-
     frame.render_widget(popup, area);
 }
 
@@ -293,16 +541,8 @@ fn draw_new_entry_popup(frame: &mut Frame, app: &App) {
     let area = centered_rect(50, 30, frame.area());
     frame.render_widget(Clear, area);
 
-    let path_style = if app.new_field == 0 {
-        Style::default().fg(ACCENT)
-    } else {
-        Style::default()
-    };
-    let stage_style = if app.new_field == 1 {
-        Style::default().fg(ACCENT)
-    } else {
-        Style::default()
-    };
+    let path_style = if app.new_field == 0 { Style::default().fg(ACCENT) } else { Style::default() };
+    let stage_style = if app.new_field == 1 { Style::default().fg(ACCENT) } else { Style::default() };
 
     let lines = vec![
         Line::from(""),
@@ -315,10 +555,6 @@ fn draw_new_entry_popup(frame: &mut Frame, app: &App) {
             Span::styled(&app.new_stage, stage_style),
         ]),
         Line::from(""),
-        Line::from(Span::styled(
-            "Tab: switch field  Enter: confirm  Esc: cancel",
-            Style::default().fg(DIM),
-        )),
     ];
 
     let popup = Paragraph::new(lines).block(
@@ -327,7 +563,6 @@ fn draw_new_entry_popup(frame: &mut Frame, app: &App) {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(ACCENT)),
     );
-
     frame.render_widget(popup, area);
 }
 
@@ -335,20 +570,10 @@ fn draw_copy_popup(frame: &mut Frame, app: &App) {
     let area = centered_rect(50, 35, frame.area());
     frame.render_widget(Clear, area);
 
-    let Some(entry) = app.selected_entry() else {
-        return;
-    };
+    let Some(entry) = app.selected_entry() else { return; };
 
-    let path_style = if app.copy_field == 0 {
-        Style::default().fg(ACCENT)
-    } else {
-        Style::default()
-    };
-    let stage_style = if app.copy_field == 1 {
-        Style::default().fg(ACCENT)
-    } else {
-        Style::default()
-    };
+    let path_style = if app.copy_field == 0 { Style::default().fg(ACCENT) } else { Style::default() };
+    let stage_style = if app.copy_field == 1 { Style::default().fg(ACCENT) } else { Style::default() };
 
     let lines = vec![
         Line::from(""),
@@ -370,82 +595,19 @@ fn draw_copy_popup(frame: &mut Frame, app: &App) {
             Span::styled(&app.copy_stage, stage_style),
         ]),
         Line::from(""),
-        Line::from(Span::styled(
-            "Tab: switch field  Enter: confirm  Esc: cancel",
-            Style::default().fg(DIM),
-        )),
     ];
 
     let popup = Paragraph::new(lines).block(
         Block::default()
-            .title(" Copy to new project ")
+            .title(" Copy ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(ACCENT)),
     );
-
     frame.render_widget(popup, area);
 }
 
-fn draw_confirm_popup(frame: &mut Frame, app: &App, view: &View) {
-    let area = centered_rect_abs(42, 8, frame.area());
-    frame.render_widget(Clear, area);
+// --- Layout helpers ---
 
-    let action = match view {
-        View::Confirm(a) => a,
-        _ => return,
-    };
-
-    let message = match action {
-        ConfirmAction::Save => "Save changes?",
-        ConfirmAction::Copy => "Copy entry?",
-        ConfirmAction::Import => "Import .env file?",
-    };
-
-    let yes_style = if app.confirm_yes {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Green)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(DIM)
-    };
-    let no_style = if !app.confirm_yes {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Red)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(DIM)
-    };
-
-    let lines = vec![
-        Line::from(""),
-        Line::from(message),
-        Line::from(""),
-        Line::from(vec![
-            Span::raw("      "),
-            Span::styled(" Yes ", yes_style),
-            Span::raw("    "),
-            Span::styled(" No ", no_style),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "←→: select  Enter: confirm  Esc: cancel",
-            Style::default().fg(DIM),
-        )),
-    ];
-
-    let popup = Paragraph::new(lines).block(
-        Block::default()
-            .title(" Confirm ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(ACCENT)),
-    );
-
-    frame.render_widget(popup, area);
-}
-
-/// Zentriertes Rect mit absoluter Breite/Hoehe (fuer Overlays die immer gleich gross sein sollen)
 fn centered_rect_abs(width: u16, height: u16, area: Rect) -> Rect {
     let w = width.min(area.width);
     let h = height.min(area.height);

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
-use std::collections::HashMap;
+use futures_util::StreamExt;
+use std::collections::{HashMap, HashSet};
 use zbus::Connection;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
@@ -12,19 +13,42 @@ const SS_COLLECTION: &str = "org.freedesktop.Secret.Collection";
 const SS_ITEM: &str = "org.freedesktop.Secret.Item";
 const SS_PROPS: &str = "org.freedesktop.DBus.Properties";
 
-struct Keyring {
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+pub fn relative_time(timestamp: u64) -> String {
+    if timestamp == 0 {
+        return "–".to_string();
+    }
+    let now = unix_now();
+    let diff = now.saturating_sub(timestamp);
+    if diff < 60 {
+        "gerade eben".to_string()
+    } else if diff < 3600 {
+        format!("vor {} Min", diff / 60)
+    } else if diff < 86400 {
+        format!("vor {} Std", diff / 3600)
+    } else {
+        format!("vor {} Tagen", diff / 86400)
+    }
+}
+
+pub struct Keyring {
     conn: Connection,
     session: OwnedObjectPath,
     collection: OwnedObjectPath,
 }
 
 impl Keyring {
-    async fn connect() -> Result<Self> {
+    pub async fn connect() -> Result<Self> {
         let conn = Connection::session()
             .await
             .context("no D-Bus session found — is gnome-keyring-daemon running?")?;
 
-        // OpenSession with plain (no crypto needed on local bus)
         let reply = conn
             .call_method(
                 Some(SS_DEST), SS_PATH, Some(SS_SERVICE), "OpenSession",
@@ -33,10 +57,11 @@ impl Keyring {
             .await?;
         let (_, session): (OwnedValue, OwnedObjectPath) = reply.body().deserialize()?;
 
-        // Find sei-secrets collection
         let collection = find_or_create_collection(&conn, &session).await?;
 
-        Ok(Keyring { conn, session, collection })
+        let kr = Keyring { conn, session, collection };
+        kr.unlock().await?;
+        Ok(kr)
     }
 
     async fn get_items(&self) -> Result<Vec<OwnedObjectPath>> {
@@ -74,8 +99,6 @@ impl Keyring {
             .await?;
         let (_session, _params, value, _content_type): (OwnedObjectPath, Vec<u8>, Vec<u8>, String) =
             reply.body().deserialize()?;
-
-        // Secrets are stored base64-encoded (zbus newline truncation workaround)
         B64.decode(&value).context("failed to decode base64 secret")
     }
 
@@ -90,7 +113,6 @@ impl Keyring {
         props.insert("org.freedesktop.Secret.Item.Label", Value::from(label));
         props.insert("org.freedesktop.Secret.Item.Attributes", Value::from(attrs));
 
-        // base64-encode to work around zbus newline truncation bug
         let encoded = B64.encode(secret);
         let secret_struct = (&*self.session, Vec::<u8>::new(), encoded.into_bytes(), "text/plain");
 
@@ -123,7 +145,7 @@ impl Keyring {
         Ok(items)
     }
 
-    async fn lock(&self) -> Result<()> {
+    pub async fn lock(&self) -> Result<()> {
         let objects = vec![&*self.collection];
         self.conn
             .call_method(Some(SS_DEST), SS_PATH, Some(SS_SERVICE), "Lock", &(objects,))
@@ -133,15 +155,159 @@ impl Keyring {
 
     async fn unlock(&self) -> Result<()> {
         let objects = vec![&*self.collection];
-        self.conn
+        let reply = self.conn
             .call_method(Some(SS_DEST), SS_PATH, Some(SS_SERVICE), "Unlock", &(objects,))
             .await?;
+        let (_unlocked, prompt): (Vec<OwnedObjectPath>, OwnedObjectPath) =
+            reply.body().deserialize()?;
+
+        if prompt.as_str() != "/" {
+            let mut stream = zbus::MessageStream::from(&self.conn);
+            self.conn
+                .call_method(
+                    Some(SS_DEST), &*prompt,
+                    Some("org.freedesktop.Secret.Prompt"), "Prompt",
+                    &("",),
+                )
+                .await?;
+            while let Some(msg) = stream.next().await {
+                let msg = msg?;
+                let header = msg.header();
+                let is_completed = header.interface()
+                    .is_some_and(|i| i.as_str() == "org.freedesktop.Secret.Prompt")
+                    && header.member()
+                    .is_some_and(|m| m.as_str() == "Completed");
+                if is_completed {
+                    let (dismissed, _result): (bool, OwnedValue) =
+                        msg.body().deserialize()?;
+                    if dismissed {
+                        bail!("Keyring-Unlock abgebrochen");
+                    }
+                    break;
+                }
+            }
+        }
         Ok(())
+    }
+
+    // --- ID management ---
+
+    async fn get_all_ids(&self) -> Result<HashSet<String>> {
+        let items = self.get_items().await?;
+        let mut ids = HashSet::new();
+        for item in &items {
+            let attrs = self.get_item_attrs(item).await?;
+            if let Some(id) = attrs.get("id") {
+                ids.insert(id.clone());
+            }
+        }
+        Ok(ids)
+    }
+
+    fn next_id(used: &HashSet<String>) -> String {
+        for i in 1u16..=999 {
+            let id = format!("{:03}", i);
+            if !used.contains(&id) {
+                return id;
+            }
+        }
+        "999".to_string()
+    }
+
+    // --- Public methods ---
+
+    pub async fn load_all_entries(&self) -> Result<Vec<EnvEntry>> {
+        self.unlock().await?;
+        let items = self.get_items().await?;
+
+        let mut entries = Vec::new();
+        for item_path in &items {
+            let attrs = self.get_item_attrs(item_path).await?;
+            if attrs.get("type").is_some_and(|t| t == "sei-dotenv") {
+                let secret = self.get_secret(item_path).await?;
+                let vars = parse_env_content(&secret);
+                entries.push(EnvEntry {
+                    id: attrs.get("id").cloned().unwrap_or_else(|| "–".to_string()),
+                    path: attrs.get("path").cloned().unwrap_or_default(),
+                    stage: attrs.get("stage").cloned().unwrap_or_else(|| "default".to_string()),
+                    vars,
+                    created_at: attrs.get("created_at").and_then(|s| s.parse().ok()).unwrap_or(0),
+                    updated_at: attrs.get("updated_at").and_then(|s| s.parse().ok()).unwrap_or(0),
+                });
+            }
+        }
+
+        entries.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(entries)
+    }
+
+    pub async fn save_envs(&self, path: &str, stage: &str, vars: &[(String, String)]) -> Result<String> {
+        self.unlock().await?;
+        let now = unix_now().to_string();
+
+        // Check for existing entry
+        let search_attrs = HashMap::from([("path", path), ("stage", stage), ("type", "sei-dotenv")]);
+        let existing = self.search_items(search_attrs).await?;
+
+        let (id, created_at) = if let Some(item) = existing.first() {
+            let attrs = self.get_item_attrs(item).await?;
+            let id = attrs.get("id").cloned().unwrap_or_else(|| {
+                // Legacy entry without ID — will be assigned below
+                String::new()
+            });
+            let created = attrs.get("created_at").cloned().unwrap_or_else(|| now.clone());
+            (id, created)
+        } else {
+            (String::new(), now.clone())
+        };
+
+        // Assign ID if missing
+        let id = if id.is_empty() {
+            let used = self.get_all_ids().await?;
+            Self::next_id(&used)
+        } else {
+            id
+        };
+
+        let content = serialize_env_vars(vars);
+        let label = format!("dotenv: {path} [{stage}]");
+        let attrs = HashMap::from([
+            ("path", path),
+            ("stage", stage),
+            ("type", "sei-dotenv"),
+            ("id", id.as_str()),
+            ("created_at", created_at.as_str()),
+            ("updated_at", now.as_str()),
+        ]);
+
+        self.create_item(&label, attrs, content.as_bytes(), true).await?;
+        Ok(id)
+    }
+
+    pub async fn delete_entry(&self, path: &str, stage: &str) -> Result<()> {
+        self.unlock().await?;
+        let attrs = HashMap::from([("path", path), ("stage", stage), ("type", "sei-dotenv")]);
+        let items = self.search_items(attrs).await?;
+        if let Some(item_path) = items.first() {
+            self.delete_item(item_path).await?;
+        } else {
+            bail!("No entry found for {path} [{stage}]");
+        }
+        Ok(())
+    }
+
+    pub async fn import_env_file(&self, env_file: &std::path::Path, path: &str, stage: &str) -> Result<String> {
+        let content = std::fs::read(env_file)
+            .with_context(|| format!("Failed to read {}", env_file.display()))?;
+        let vars = parse_env_content(&content);
+        if vars.is_empty() {
+            bail!("No valid KEY=VALUE pairs found in {}", env_file.display());
+        }
+        self.save_envs(path, stage, &vars).await
     }
 }
 
 async fn find_or_create_collection(conn: &Connection, _session: &OwnedObjectPath) -> Result<OwnedObjectPath> {
-    // List all collections
     let reply = conn
         .call_method(Some(SS_DEST), SS_PATH, Some(SS_PROPS), "Get", &(SS_SERVICE, "Collections"))
         .await?;
@@ -149,7 +315,6 @@ async fn find_or_create_collection(conn: &Connection, _session: &OwnedObjectPath
     let collections: Vec<OwnedObjectPath> = value.try_into()
         .map_err(|_| anyhow::anyhow!("failed to read Collections"))?;
 
-    // Find by label
     for col_path in &collections {
         let reply = conn
             .call_method(Some(SS_DEST), &**col_path, Some(SS_PROPS), "Get", &(SS_COLLECTION, "Label"))
@@ -157,14 +322,10 @@ async fn find_or_create_collection(conn: &Connection, _session: &OwnedObjectPath
         let value: OwnedValue = reply.body().deserialize()?;
         let label: String = value.try_into().unwrap_or_default();
         if label == COLLECTION_LABEL {
-            // Unlock
-            let objects = vec![&**col_path];
-            conn.call_method(Some(SS_DEST), SS_PATH, Some(SS_SERVICE), "Unlock", &(objects,)).await?;
             return Ok(col_path.clone());
         }
     }
 
-    // Create — try standard CreateCollection first
     let mut props: HashMap<&str, Value> = HashMap::new();
     props.insert("org.freedesktop.Secret.Collection.Label", Value::from(COLLECTION_LABEL));
 
@@ -178,7 +339,6 @@ async fn find_or_create_collection(conn: &Connection, _session: &OwnedObjectPath
         return Ok(col_path);
     }
 
-    // Prompt was returned — try to perform it (will fail headless)
     if prompt_path.as_str() != "/" {
         conn.call_method(Some(SS_DEST), &*prompt_path, Some("org.freedesktop.Secret.Prompt"), "Prompt", &("",)).await?;
     }
@@ -186,17 +346,18 @@ async fn find_or_create_collection(conn: &Connection, _session: &OwnedObjectPath
     bail!("Keyring konnte nicht erstellt werden — GUI-Prompt erforderlich")
 }
 
-// --- Public API (unchanged signatures) ---
+// --- Standalone helpers ---
 
-/// Entry representing one project+stage combo
 #[derive(Debug, Clone)]
 pub struct EnvEntry {
+    pub id: String,
     pub path: String,
     pub stage: String,
     pub vars: Vec<(String, String)>,
+    pub created_at: u64,
+    pub updated_at: u64,
 }
 
-/// Parse KEY=VALUE pairs from raw secret bytes
 pub fn parse_env_content(content: &[u8]) -> Vec<(String, String)> {
     String::from_utf8_lossy(content)
         .lines()
@@ -211,7 +372,6 @@ pub fn parse_env_content(content: &[u8]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Serialize env vars to KEY=VALUE string
 pub fn serialize_env_vars(vars: &[(String, String)]) -> String {
     vars.iter()
         .map(|(k, v)| format!("{k}={v}"))
@@ -219,115 +379,34 @@ pub fn serialize_env_vars(vars: &[(String, String)]) -> String {
         .join("\n")
 }
 
-/// Sperrt die sei-secrets Collection (beim TUI-Quit)
-pub async fn lock_collection() -> Result<()> {
+/// Load env vars by ID (sei run shorthand — own connection, lock after)
+pub async fn load_envs_by_id(id: &str) -> Result<Vec<(String, String)>> {
     let kr = Keyring::connect().await?;
-    kr.lock().await?;
-    Ok(())
-}
-
-/// Load all entries from the keyring (TUI — kein Lock danach)
-pub async fn load_all_entries() -> Result<Vec<EnvEntry>> {
-    let kr = Keyring::connect().await?;
-    kr.unlock().await?;
-    let items = kr.get_items().await?;
-
-    let mut entries = Vec::new();
-    for item_path in &items {
-        let attrs = kr.get_item_attrs(item_path).await?;
-        let path = attrs.get("path").cloned().unwrap_or_default();
-        let stage = attrs.get("stage").cloned().unwrap_or_else(|| "default".to_string());
-
-        if attrs.get("type").is_some_and(|t| t == "sei-dotenv") {
-            let secret = kr.get_secret(item_path).await?;
-            let vars = parse_env_content(&secret);
-            entries.push(EnvEntry { path, stage, vars });
-        }
-    }
-
-    entries.sort_by(|a, b| a.path.cmp(&b.path).then(a.stage.cmp(&b.stage)));
-    Ok(entries)
-}
-
-/// Load env vars for a specific path and stage (sei run — Lock danach)
-pub async fn load_envs(path: &str, stage: &str) -> Result<Vec<(String, String)>> {
-    let kr = Keyring::connect().await?;
-    kr.unlock().await?;
-
-    let attrs = HashMap::from([
-        ("path", path),
-        ("stage", stage),
-        ("type", "sei-dotenv"),
-    ]);
-
+    let attrs = HashMap::from([("id", id), ("type", "sei-dotenv")]);
     let items = kr.search_items(attrs).await?;
-
     let result = if let Some(item_path) = items.first() {
         let secret = kr.get_secret(item_path).await?;
         parse_env_content(&secret)
     } else {
         Vec::new()
     };
-
     kr.lock().await?;
     Ok(result)
 }
 
-/// Save env vars for a specific path and stage
-pub async fn save_envs(path: &str, stage: &str, vars: &[(String, String)]) -> Result<()> {
+/// Load env vars for a specific path and stage (sei run — own connection, lock after)
+pub async fn load_envs(path: &str, stage: &str) -> Result<Vec<(String, String)>> {
     let kr = Keyring::connect().await?;
-    kr.unlock().await?;
-
-    let content = serialize_env_vars(vars);
-    let label = format!("dotenv: {path} [{stage}]");
-    let attrs = HashMap::from([
-        ("path", path),
-        ("stage", stage),
-        ("type", "sei-dotenv"),
-    ]);
-
-    kr.create_item(&label, attrs, content.as_bytes(), true).await?;
-    Ok(())
-}
-
-/// Delete env entry for a specific path and stage
-pub async fn delete_entry(path: &str, stage: &str) -> Result<()> {
-    let kr = Keyring::connect().await?;
-    kr.unlock().await?;
-
-    let attrs = HashMap::from([
-        ("path", path),
-        ("stage", stage),
-        ("type", "sei-dotenv"),
-    ]);
-
+    let attrs = HashMap::from([("path", path), ("stage", stage), ("type", "sei-dotenv")]);
     let items = kr.search_items(attrs).await?;
-
-    if let Some(item_path) = items.first() {
-        kr.delete_item(item_path).await?;
+    let result = if let Some(item_path) = items.first() {
+        let secret = kr.get_secret(item_path).await?;
+        parse_env_content(&secret)
     } else {
-        bail!("No entry found for {path} [{stage}]");
-    }
-
-    Ok(())
-}
-
-/// Import a .env file into the keyring
-pub async fn import_env_file(
-    env_file: &std::path::Path,
-    path: &str,
-    stage: &str,
-) -> Result<()> {
-    let content = std::fs::read(env_file)
-        .with_context(|| format!("Failed to read {}", env_file.display()))?;
-    let vars = parse_env_content(&content);
-
-    if vars.is_empty() {
-        bail!("No valid KEY=VALUE pairs found in {}", env_file.display());
-    }
-
-    save_envs(path, stage, &vars).await?;
-    Ok(())
+        Vec::new()
+    };
+    kr.lock().await?;
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -365,10 +444,7 @@ mod tests {
 
     #[test]
     fn test_serialize_env_vars() {
-        let vars = vec![
-            ("A".into(), "1".into()),
-            ("B".into(), "2".into()),
-        ];
+        let vars = vec![("A".into(), "1".into()), ("B".into(), "2".into())];
         assert_eq!(serialize_env_vars(&vars), "A=1\nB=2");
     }
 
@@ -383,9 +459,19 @@ mod tests {
         assert_eq!(original, parsed);
     }
 
-    // Integration test — needs D-Bus + gnome-keyring (Containerfile test stage)
+    #[test]
+    fn test_relative_time() {
+        assert_eq!(relative_time(0), "–");
+        let now = unix_now();
+        assert_eq!(relative_time(now), "gerade eben");
+        assert_eq!(relative_time(now - 120), "vor 2 Min");
+        assert_eq!(relative_time(now - 7200), "vor 2 Std");
+        assert_eq!(relative_time(now - 172800), "vor 2 Tagen");
+    }
+
     #[tokio::test]
     async fn test_keyring_save_load_delete() {
+        let kr = Keyring::connect().await.expect("connect failed");
         let path = "/tmp/sei-test-integration";
         let stage = "test";
         let vars = vec![
@@ -393,17 +479,36 @@ mod tests {
             ("ANOTHER".into(), "123".into()),
         ];
 
-        save_envs(path, stage, &vars).await.expect("save failed");
+        let id = kr.save_envs(path, stage, &vars).await.expect("save failed");
+        assert_eq!(id.len(), 3);
+
+        let all = kr.load_all_entries().await.expect("load_all failed");
+        let entry = all.iter().find(|e| e.path == path && e.stage == stage).unwrap();
+        assert_eq!(entry.vars, vars);
+        assert_eq!(entry.id, id);
+        assert!(entry.created_at > 0);
+        assert!(entry.updated_at > 0);
+
+        kr.delete_entry(path, stage).await.expect("delete failed");
+
+        let after = kr.load_all_entries().await.expect("load_all after delete failed");
+        assert!(!after.iter().any(|e| e.path == path && e.stage == stage));
+    }
+
+    #[tokio::test]
+    async fn test_load_envs_standalone() {
+        let kr = Keyring::connect().await.expect("connect failed");
+        let path = "/tmp/sei-test-load-envs";
+        let stage = "test";
+        let vars = vec![("KEY".into(), "val".into())];
+
+        kr.save_envs(path, stage, &vars).await.expect("save failed");
+        drop(kr);
 
         let loaded = load_envs(path, stage).await.expect("load failed");
         assert_eq!(loaded, vars);
 
-        let all = load_all_entries().await.expect("load_all failed");
-        assert!(all.iter().any(|e| e.path == path && e.stage == stage));
-
-        delete_entry(path, stage).await.expect("delete failed");
-
-        let after = load_envs(path, stage).await.expect("load after delete failed");
-        assert!(after.is_empty());
+        let kr = Keyring::connect().await.expect("reconnect failed");
+        kr.delete_entry(path, stage).await.expect("delete failed");
     }
 }
