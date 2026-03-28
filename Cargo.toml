@@ -1,0 +1,29 @@
+[package]
+name = "sei"
+version = "0.1.0"
+edition = "2024"
+description = "Save Env Inject — manage .env secrets in GNOME Keyring via TUI"
+license = "LicenseRef-not-yet-licensed"
+authors = ["xi72yow <xi72yow@github.com>"]
+
+[dependencies]
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+tokio = { version = "1.50.0", features = ["macros", "rt-multi-thread", "process"] }
+ratatui = "0.30.0"
+ratatui-textarea = "0.8.0"
+crossterm = "0.29.0"
+clap = { version = "4.6.0", features = ["derive"] }
+anyhow = "1.0.102"
+base64 = "0.22"
+
+[profile.release]
+strip = true
+lto = true
+
+[package.metadata.deb]
+maintainer = "xi72yow <xi72yow@github.com>"
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/sei", "usr/bin/", "755"],
+]
