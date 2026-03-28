@@ -44,7 +44,7 @@ jobs:
         run: docker save build-image | zstd -T0 -o image.tar.zst
 
       - name: Upload container image
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: build-image
           path: image.tar.zst
