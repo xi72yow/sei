@@ -1,5 +1,7 @@
 # sei - Save Env Inject
 
+> *You don't leave your front door open just because you'll need to get back in tomorrow.*
+
 Manages environment secrets in GNOME Keyring instead of `.env` files. TUI for editing, CLI for injection.
 
 ## Why?
