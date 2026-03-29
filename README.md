@@ -41,16 +41,34 @@ graph TB
 
 ## Installation
 
-```bash
-# Build + install (requires Podman)
-./build.sh --install
+### Script (recommended)
 
-# Or build only
-./build.sh
-sudo apt install --reinstall ./dist/sei_0.1.0-1_amd64.deb
+```bash
+curl -fsSL https://xi72yow.github.io/sei/install.sh | sudo bash
 ```
 
-Prerequisite: Running GNOME Keyring daemon (`gnome-keyring-daemon`). Also works with KeePassXC or any other daemon implementing the [freedesktop Secret Service API](https://specifications.freedesktop.org/secret-service/latest/).
+This adds the sei APT repository and installs the package. Updates come via `apt upgrade`.
+
+### Manual (build from source)
+
+Requires Podman.
+
+```bash
+git clone https://github.com/xi72yow/sei.git
+cd sei
+./build.sh --install
+```
+
+Or build only and install separately:
+
+```bash
+./build.sh
+sudo apt install --reinstall ./dist/sei_*.deb
+```
+
+### Prerequisite
+
+A running Secret Service daemon — GNOME Keyring (`gnome-keyring-daemon`), KeePassXC, or any other daemon implementing the [freedesktop Secret Service API](https://specifications.freedesktop.org/secret-service/latest/).
 
 ## Usage
 
