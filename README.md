@@ -78,46 +78,13 @@ A running Secret Service daemon — GNOME Keyring (`gnome-keyring-daemon`), KeeP
 sei
 ```
 
-```
- Import (2) │ Store                     /home/user/myapp
-┌─ .env Dateien (2) ────────┬─ Diff ───────────────────────────┐
-│                            │                                   │
-│ ▸ [x] .env (neu)          │  .env → [default]                 │
-│   [x] .env.prod (update)  │                                   │
-│                            │  + DB_HOST=localhost               │
-│                            │  + DB_PORT=5432                   │
-│                            │  + DB_PASS=s3cr3t                 │
-│                            │                                   │
-├────────────────────────────┴───────────────────────────────────┤
-│                                                                │
-│ ↑↓ nav │ Space an/aus │ Enter importieren │ Tab Store │ Esc   │
-└────────────────────────────────────────────────────────────────┘
-```
+<img width="1576" height="1066" alt="Bildschirmfoto vom 2026-03-29 11-32-55" src="https://github.com/user-attachments/assets/5d2d0e94-cc7f-4601-b2af-7d8f1e2e6797" />
 
 On startup, `sei` scans for `.env*` files in the current directory. If new or changed files are found, the **Import** tab opens automatically with a diff view. Stage names are derived from the file suffix (`.env` → default, `.env.production` → production).
 
 After import, the **Store** tab shows all keyring entries:
 
-```
- Import │ Store                          /home/user/myapp
-┌─ Projects ─────────────────┬─ Details ────────────────────────┐
-│                             │                                  │
-│ ▸ 001 myapp [default]      │  ID:    001                      │
-│   002 myapp [production]   │  Path:  /home/user/myapp         │
-│   003 api [default]        │  Stage: default                  │
-│                             │  Keys:  4                        │
-│                             │  Erstellt:  vor 2 Std            │
-│                             │  Geaendert: gerade eben          │
-│                             │                                  │
-│                             │  Key        Value                │
-│                             │  DB_HOST    ••••••••             │
-│                             │  DB_PASS    ••••••••             │
-│                             │                                  │
-├─────────────────────────────┴──────────────────────────────────┤
-│ ✓ 2 importiert [001, 002]                                      │
-│ [E]dit [D]elete [C]opy [S]how [N]ew [I]mport │ Tab │ Esc quit │
-└────────────────────────────────────────────────────────────────┘
-```
+<img width="1576" height="1066" alt="Bildschirmfoto vom 2026-03-29 11-34-58" src="https://github.com/user-attachments/assets/40c87279-c4c7-44de-b7d0-9887b5e8dd70" />
 
 Each entry gets a **3-digit ID** (001–999) for quick CLI access. Entries matching the current directory are highlighted. All keybindings are shown in the footer.
 
