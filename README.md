@@ -106,6 +106,8 @@ sei run -p ~/projects/api -s prod -- node server.js
 sei run --id 001 -- --some-flag
 ```
 
+<img width="1576" height="1066" alt="Bildschirmfoto vom 2026-03-29 11-41-10" src="https://github.com/user-attachments/assets/49c450c9-9e1d-4e3c-9e28-86d3b77ea72e" />
+
 When no ID is given, `sei` shows an inline picker to select an entry before running the command. Entries matching the current directory are shown first.
 
 Secrets are passed via environment inheritance — no temp files, no CLI arguments. The keyring is locked after loading.
