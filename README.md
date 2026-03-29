@@ -20,10 +20,10 @@ Manages environment secrets in GNOME Keyring instead of `.env` files. TUI for ed
 ```mermaid
 graph TB
     subgraph "Without sei"
-        A[".env file<br/><i>Plaintext in project directory</i>"] -->|reads| B["Claude Code"]
-        A -->|reads| C["Trivy / Scanner"]
-        A -->|reads| D["git add ."]
-        A -->|reads| E["Application"]
+        B["Claude Code"] -->|reads| A[".env file<br/><i>Plaintext in project directory</i>"]
+        C["Trivy / Scanner"] -->|reads| A
+        D["git add ."] -->|reads| A
+        E["Application"] -->|reads| A
     end
 ```
 
