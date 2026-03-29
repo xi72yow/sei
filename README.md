@@ -91,7 +91,10 @@ Each entry gets a **3-digit ID** (001–999) for quick CLI access. Entries match
 ### Running Commands
 
 ```bash
-# By ID (recommended)
+# Inline picker — choose entry interactively
+sei node server.js
+
+# By ID (skip picker)
 sei 001 node server.js
 sei 002 podman compose up -d
 
@@ -102,6 +105,8 @@ sei run -p ~/projects/api -s prod -- node server.js
 # -- only needed when cmd starts with a flag
 sei run --id 001 -- --some-flag
 ```
+
+When no ID is given, `sei` shows an inline picker to select an entry before running the command. Entries matching the current directory are shown first.
 
 Secrets are passed via environment inheritance — no temp files, no CLI arguments. The keyring is locked after loading.
 
