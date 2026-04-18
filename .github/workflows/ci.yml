@@ -175,7 +175,7 @@ jobs:
           generate_release_notes: true
 
       - name: Upload repo artifact
-        uses: actions/upload-pages-artifact@v4
+        uses: actions/upload-pages-artifact@v5
         with:
           path: repo/
 
