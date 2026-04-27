@@ -386,9 +386,22 @@ pub fn parse_env_content(content: &[u8]) -> Vec<(String, String)> {
         })
         .filter_map(|line| {
             let (key, value) = line.split_once('=')?;
-            Some((key.trim().to_string(), value.trim().to_string()))
+            Some((key.trim().to_string(), strip_quotes(value.trim()).to_string()))
         })
         .collect()
+}
+
+/// strip matching surrounding single or double quotes from a value
+fn strip_quotes(value: &str) -> &str {
+    let bytes = value.as_bytes();
+    if bytes.len() >= 2 {
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if (first == b'"' || first == b'\'') && first == last {
+            return &value[1..value.len() - 1];
+        }
+    }
+    value
 }
 
 pub fn serialize_env_vars(vars: &[(String, String)]) -> String {
@@ -458,6 +471,21 @@ mod tests {
         let vars = parse_env_content(content);
         assert_eq!(vars, vec![
             ("URL".into(), "postgres://user:pass@host/db?opt=1".into()),
+        ]);
+    }
+
+    #[test]
+    fn test_parse_env_content_strips_quotes() {
+        let content = b"DOUBLE=\"hello world\"\nSINGLE='foo bar'\nMIXED=\"unmatched'\nLONE=\"\nEMPTY_DQ=\"\"\nINNER=he\"llo\nNAKED=plain";
+        let vars = parse_env_content(content);
+        assert_eq!(vars, vec![
+            ("DOUBLE".into(), "hello world".into()),
+            ("SINGLE".into(), "foo bar".into()),
+            ("MIXED".into(), "\"unmatched'".into()),
+            ("LONE".into(), "\"".into()),
+            ("EMPTY_DQ".into(), "".into()),
+            ("INNER".into(), "he\"llo".into()),
+            ("NAKED".into(), "plain".into()),
         ]);
     }
 
